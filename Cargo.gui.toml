@@ -1,0 +1,39 @@
+[package]
+name = "matrix_terminal_gui"
+version = "0.1.0"
+edition = "2021"
+description = "A Matrix-inspired terminal multiplexer with a native GUI"
+authors = ["Josh Kornreich"]
+
+[dependencies]
+# GUI Framework
+iced = { version = "0.10", features = ["canvas", "image", "debug"] }
+
+# Terminal Emulation
+alacritty_terminal = "0.20.0"
+
+# PTY handling
+portable-pty = "0.8.1"
+
+# General utilities
+uuid = { version = "1.7.0", features = ["v4", "serde"] }
+anyhow = "1.0.80"
+log = "0.4.20"
+env_logger = "0.10.1"
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.114"
+dirs = "5.0.1"
+image = "0.24.8"
+
+[lib]
+name = "matrix_gui"
+path = "src/gui/lib.rs"
+
+[[bin]]
+name = "matrix_terminal_gui"
+path = "src/gui/main.rs"
+
+[features]
+default = []
+wayland = ["iced/wayland"]
+x11 = ["iced/x11"]

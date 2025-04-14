@@ -1,0 +1,11 @@
+[package]
+name = "MatrixDebug"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "matrix_debug"
+path = "debug_matrix.rs"
+
+[dependencies]
+term_size = "0.3.2"

@@ -1,0 +1,1977 @@
+use iced::{
+    Application, Command, Element, Settings, Theme, theme, Background, Color, Length, Size, keyboard, window,
+    executor, Subscription, time, Event,
+};
+use iced::widget::{column, container, row, text, vertical_space, button, scrollable};
+use iced::subscription;
+use iced::alignment::{Horizontal, Vertical};
+
+use std::time::{Duration, Instant};
+use rand::Rng;
+
+fn main() -> iced::Result {
+    env_logger::init();
+    
+    MatrixTerminal::run(Settings {
+        window: window::Settings {
+            size: (800, 600),
+            min_size: Some((400, 300)),
+            position: window::Position::Centered,
+            decorations: true,
+            resizable: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
+
+// Define types of terminal layouts
+#[derive(Debug, Clone, PartialEq)]
+enum TerminalLayout {
+    Single,
+    HorizontalSplit,
+    VerticalSplit,
+    Grid,
+    Zoomed(usize), // Index of the zoomed terminal
+}
+
+struct MatrixTerminal {
+    // Terminal state
+    terminal_content: Vec<String>,
+    cursor_position: usize,
+    cursor_visible: bool,
+    cursor_blink_timer: Instant,
+    
+    // Time tracking
+    last_update: Instant,
+    
+    // Random number generator
+    rng: rand::rngs::ThreadRng,
+    
+    // Scrolling state
+    scroll_to_bottom: bool,
+    
+    // Animation state
+    show_intro_animation: bool,
+    
+    // Layout state
+    layout: TerminalLayout,
+    
+    // Additional terminal tabs (for split view)
+    secondary_terminals: Vec<Vec<String>>,
+    
+    // Focus tracking
+    focused_terminal: usize, // 0 for primary, 1+ for secondary terminals
+    
+    // Cursor tracking for secondary terminals
+    secondary_cursors: Vec<usize>, // Cursor positions for secondary terminals
+    
+    // Screen information for positioning and sizing
+    screen_info: ScreenInfo,
+    
+    // Current size division - determines how much of the screen the window occupies
+    // Value is 1-8, where 1 = 1/8 screen size, 8 = full screen
+    size_division: u8,
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    // Sidebar interaction
+    SidebarIconClicked(SidebarIcon),
+    
+    // Input events
+    KeyPressed(keyboard::KeyCode, keyboard::Modifiers),
+    
+    // System events
+    Tick,
+    
+    // Scrolling control
+    ScrollToExact(f32), // 0.0 = top, 1.0 = bottom
+    
+    // Window management
+    NewWindow,
+    ResizeWindow(u32, u32), // width, height
+    
+    // Screen info for positioning/sizing
+    ScreenInfoReceived(ScreenInfo),
+}
+
+// Structure to hold screen information
+#[derive(Debug, Clone)]
+struct ScreenInfo {
+    width: u32,
+    height: u32,
+    // Position is used to place window at bottom right
+    x: i32,
+    y: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarIcon {
+    NewWindow,
+    SplitHorizontal,
+    SplitVertical,
+    GridLayout,
+    Zoom,
+    Close,
+    SizeIncrease, // + button to increase size by 10%
+    SizeDecrease, // - button to decrease size by 10%
+}
+
+// Matrix colors
+const MATRIX_GREEN: Color = Color {
+    r: 0.0,
+    g: 1.0,
+    b: 0.255,
+    a: 1.0,
+};
+
+const DARK_GREEN: Color = Color {
+    r: 0.0,
+    g: 0.7,
+    b: 0.176,
+    a: 1.0,
+};
+
+const BACKGROUND: Color = Color::BLACK;
+
+// Version information
+const VERSION: &str = "v0.6";
+
+// Main container style
+struct MatrixStyle;
+
+impl container::StyleSheet for MatrixStyle {
+    type Style = Theme;
+
+    fn appearance(&self, _style: &Self::Style) -> container::Appearance {
+        container::Appearance {
+            text_color: Some(MATRIX_GREEN),
+            background: Some(Background::Color(BACKGROUND)),
+            border_radius: 0.0.into(),
+            border_width: 1.0,
+            border_color: MATRIX_GREEN,
+        }
+    }
+}
+
+// Sidebar style
+struct SidebarStyle;
+
+impl container::StyleSheet for SidebarStyle {
+    type Style = Theme;
+
+    fn appearance(&self, _style: &Self::Style) -> container::Appearance {
+        container::Appearance {
+            text_color: Some(MATRIX_GREEN),
+            background: Some(Background::Color(BACKGROUND)),
+            border_radius: 0.0.into(),
+            border_width: 0.0,
+            border_color: DARK_GREEN,
+        }
+    }
+}
+
+// Terminal styles
+struct TerminalStyle {
+    focused: bool, // Whether this terminal is the focused one
+}
+
+impl container::StyleSheet for TerminalStyle {
+    type Style = Theme;
+
+    fn appearance(&self, _style: &Self::Style) -> container::Appearance {
+        container::Appearance {
+            text_color: Some(MATRIX_GREEN),
+            background: Some(Background::Color(BACKGROUND)),
+            border_radius: 0.0.into(),
+            border_width: 2.0,
+            border_color: if self.focused { MATRIX_GREEN } else { DARK_GREEN },
+        }
+    }
+}
+
+// Button styles
+struct IconButtonStyle;
+
+impl button::StyleSheet for IconButtonStyle {
+    type Style = Theme;
+
+    fn active(&self, _style: &Self::Style) -> button::Appearance {
+        button::Appearance {
+            text_color: DARK_GREEN,
+            background: Some(Background::Color(BACKGROUND)),
+            border_radius: 0.0.into(),
+            border_width: 0.0,
+            border_color: DARK_GREEN,
+            shadow_offset: iced::Vector::new(0.0, 0.0),
+        }
+    }
+    
+    fn hovered(&self, _style: &Self::Style) -> button::Appearance {
+        // Change appearance when hovered
+        button::Appearance {
+            text_color: MATRIX_GREEN,
+            background: Some(Background::Color(Color {
+                r: 0.0, g: 0.2, b: 0.05, a: 0.3,
+            })),
+            border_radius: 0.0.into(),
+            border_width: 1.0,
+            border_color: MATRIX_GREEN,
+            shadow_offset: iced::Vector::new(0.0, 0.0),
+        }
+    }
+}
+
+impl Application for MatrixTerminal {
+    type Executor = executor::Default;
+    type Theme = Theme;
+    type Message = Message;
+    type Flags = ();
+
+    fn new(_flags: Self::Flags) -> (Self, Command<Message>) {
+        // Create a much simpler welcome message - will be replaced by animation
+        let welcome_message = vec![
+            "Wake up, Neo... The Matrix has you...".to_string(),
+            "".to_string(),
+            "neo@matrix:~$ ".to_string(),
+        ];
+        
+        // We'll add the animation via the first tick message
+        
+        // Create a centered header with fill characters for secondary terminals
+        let terminal_width: usize = 80; // Standard terminal width
+        let title = format!(" THE MATRIX {} ", VERSION);
+        let fill_char = '═';
+        
+        // Calculate padding to center the title
+        let remaining_width = terminal_width.saturating_sub(title.len());
+        let left_pad = remaining_width / 2;
+        let right_pad = remaining_width - left_pad;
+        
+        // Create the centered title with fill characters on both sides
+        let header = format!(
+            "{}{}{}",
+            fill_char.to_string().repeat(left_pad),
+            title,
+            fill_char.to_string().repeat(right_pad)
+        );
+        
+        // Default welcome message for secondary terminals with full-width header
+        let secondary_welcome = vec![
+            "".to_string(),
+            header,
+            "".to_string(),
+            "neo@matrix:~$ ".to_string(),
+        ];
+        
+        // Create additional terminal tabs for split views
+        let mut secondary_terminals = Vec::new();
+        
+        // Add 3 secondary terminals (enough for grid layout)
+        for _ in 0..3 {
+            secondary_terminals.push(secondary_welcome.clone());
+        }
+        
+        // Create a vec of cursor positions for secondary terminals
+        let mut secondary_cursors = Vec::new();
+        for _ in 0..secondary_terminals.len() {
+            secondary_cursors.push("neo@matrix:~$ ".len());
+        }
+        
+        // Default screen info (will be updated when we get actual screen info)
+        let default_screen_info = ScreenInfo {
+            width: 1920, // Assume a common default
+            height: 1080,
+            x: 0,
+            y: 0,
+        };
+        
+        let app = Self {
+            terminal_content: welcome_message,
+            cursor_position: "neo@matrix:~$ ".len(),
+            cursor_visible: true,
+            cursor_blink_timer: Instant::now(),
+            last_update: Instant::now(),
+            rng: rand::thread_rng(),
+            scroll_to_bottom: true, // Initialize with true to scroll to bottom ONLY on startup
+            show_intro_animation: true, // Show the animation on first run
+            layout: TerminalLayout::Single, // Start with a single terminal
+            secondary_terminals,
+            focused_terminal: 0, // Primary terminal is focused by default
+            secondary_cursors,
+            screen_info: default_screen_info,
+            size_division: 2, // Start at 2/8 (1/4) of the screen size
+        };
+        
+        // Create a command to get screen information
+        let command = Command::perform(
+            async {
+                // Get screen dimensions and position (approximation)
+                // In a real implementation we'd use the native screen API
+                // For now we'll use a reasonable default for Mac displays
+                let width = 1920;
+                let height = 1080;
+                
+                // Calculate position for bottom right
+                let x = width as i32 - (width as i32 / 4); // 3/4 of the way across
+                let y = height as i32 - (height as i32 / 4); // 3/4 of the way down
+                
+                ScreenInfo {
+                    width, height, x, y
+                }
+            },
+            Message::ScreenInfoReceived
+        );
+        
+        (app, command)
+    }
+
+    fn title(&self) -> String {
+        format!("Matrix Terminal {}", VERSION)
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        Subscription::batch(vec![
+            // System events for keyboard input
+            subscription::events_with(|event, _| {
+                if let Event::Keyboard(keyboard::Event::KeyPressed { key_code, modifiers, .. }) = event {
+                    Some(Message::KeyPressed(key_code, modifiers))
+                } else {
+                    None
+                }
+            }),
+            
+            // Timer for cursor blinking
+            time::every(Duration::from_millis(500)).map(|_| Message::Tick),
+        ])
+    }
+
+    fn update(&mut self, message: Message) -> Command<Message> {
+        // Start with no command by default
+        let mut command = Command::none();
+        
+        match message {
+            Message::ScreenInfoReceived(info) => {
+                // Store screen information
+                self.screen_info = info;
+                
+                // Calculate and set initial window size based on screen info (2/8 of screen size)
+                let width = self.screen_info.width / 4; // 2/8 = 1/4
+                let height = self.screen_info.height / 4;
+                
+                // Position at bottom-right corner
+                let position_x = self.screen_info.width as i32 - width as i32;
+                let position_y = self.screen_info.height as i32 - height as i32;
+                
+                // Apply the size and position
+                command = Command::batch(vec![
+                    command,
+                    window::resize(Size::new(width, height)),
+                    window::move_to(position_x, position_y),
+                ]);
+            },
+            
+            Message::SidebarIconClicked(icon) => {
+                match icon {
+                    // Window size control buttons
+                    SidebarIcon::SizeIncrease => {
+                        // Increase size in 1/8 increments (maximum 8/8 = full screen)
+                        if self.size_division < 8 {
+                            self.size_division += 1;
+                            
+                            // Calculate new size based on screen dimensions
+                            let new_width = (self.screen_info.width as f32 * (self.size_division as f32 / 8.0)).round() as u32;
+                            let new_height = (self.screen_info.height as f32 * (self.size_division as f32 / 8.0)).round() as u32;
+                            
+                            // If we're at maximum size, position at top-left (0,0)
+                            // Otherwise position at bottom-right
+                            let (position_x, position_y) = if self.size_division == 8 {
+                                (0, 0)
+                            } else {
+                                let pos_x = self.screen_info.width as i32 - new_width as i32;
+                                let pos_y = self.screen_info.height as i32 - new_height as i32;
+                                (pos_x, pos_y)
+                            };
+                            
+                            // Update the window size and position via command
+                            command = Command::batch(vec![
+                                command,
+                                window::resize(Size::new(new_width, new_height)),
+                                window::move_to(position_x, position_y),
+                            ]);
+                            
+                            // Add message to the terminal
+                            self.terminal_content.push(format!("Increased window size to {}/8 of screen", self.size_division));
+                            self.terminal_content.push("neo@matrix:~$ ".to_string());
+                            self.cursor_position = "neo@matrix:~$ ".len();
+                            self.scroll_to_bottom = true;
+                        }
+                    },
+                    SidebarIcon::SizeDecrease => {
+                        // Decrease size in 1/8 increments (minimum 1/8)
+                        if self.size_division > 1 {
+                            self.size_division -= 1;
+                            
+                            // Calculate new size based on screen dimensions
+                            let new_width = (self.screen_info.width as f32 * (self.size_division as f32 / 8.0)).round() as u32;
+                            let new_height = (self.screen_info.height as f32 * (self.size_division as f32 / 8.0)).round() as u32;
+                            
+                            // Make sure we don't go below minimum size
+                            let new_width = new_width.max(400);
+                            let new_height = new_height.max(300);
+                            
+                            // Position at bottom-right
+                            let position_x = self.screen_info.width as i32 - new_width as i32;
+                            let position_y = self.screen_info.height as i32 - new_height as i32;
+                            
+                            // Update the window size and position via command
+                            command = Command::batch(vec![
+                                command,
+                                window::resize(Size::new(new_width, new_height)),
+                                window::move_to(position_x, position_y),
+                            ]);
+                            
+                            // Add message to the terminal
+                            self.terminal_content.push(format!("Decreased window size to {}/8 of screen", self.size_division));
+                            self.terminal_content.push("neo@matrix:~$ ".to_string());
+                            self.cursor_position = "neo@matrix:~$ ".len();
+                            self.scroll_to_bottom = true;
+                        }
+                    },
+                    // Regular layout buttons
+                    _ => {
+                        let cmd_name = match icon {
+                            SidebarIcon::NewWindow => "new-window",
+                            SidebarIcon::SplitHorizontal => "split-h",
+                            SidebarIcon::SplitVertical => "split-v",
+                            SidebarIcon::GridLayout => "layout-grid",
+                            SidebarIcon::Zoom => "zoom",
+                            SidebarIcon::Close => "close",
+                            _ => "", // We shouldn't reach here
+                        };
+                        
+                        // Add the command to the terminal
+                        if let Some(last) = self.terminal_content.last_mut() {
+                            if last.starts_with("neo@matrix") {
+                                let current_prompt = last.clone();
+                                *last = format!("{}{}", current_prompt, cmd_name);
+                                self.terminal_content.push(format!("Executing: {}", cmd_name));
+                                self.terminal_content.push("neo@matrix:~$ ".to_string());
+                                self.cursor_position = "neo@matrix:~$ ".len();
+                                
+                                // Set flag to scroll to the bottom only when executing a command via icon
+                                self.scroll_to_bottom = true;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Handle the ScrollToExact message for programmatic scrolling
+            Message::ScrollToExact(position) => {
+                // This message triggers programmatic scrolling to an exact position
+                if position >= 1.0 {
+                    // Create a command to scroll to the bottom
+                    command = Command::batch(vec![
+                        command,
+                        scrollable::scroll_to(
+                            scrollable::Id::new("terminal_scroll"),
+                            scrollable::AbsoluteOffset {
+                                x: 0.0,
+                                y: 1.0, // 1.0 means bottom
+                            }
+                        )
+                    ]);
+                } else if position <= 0.0 {
+                    // Create a command to scroll to the top (unused in this app)
+                    command = Command::batch(vec![
+                        command,
+                        scrollable::scroll_to(
+                            scrollable::Id::new("terminal_scroll"),
+                            scrollable::AbsoluteOffset {
+                                x: 0.0,
+                                y: 0.0, // 0.0 means top
+                            }
+                        )
+                    ]);
+                }
+            }
+            
+            // Handle the NewWindow message by showing information
+            Message::NewWindow => {
+                // In a full implementation, this would create a new window process
+                self.terminal_content.push("Window creation isn't implemented in this prototype.".to_string());
+                self.terminal_content.push("To create a new window, please use the command line:".to_string());
+                self.terminal_content.push("$ open matrix-gui/target/release/matrix_simple_gui".to_string());
+                
+                // Scroll to make this information visible
+                command = Command::perform(
+                    async { () },
+                    |_| Message::ScrollToExact(1.0)
+                );
+            },
+            
+            // Handle window resizing
+            Message::ResizeWindow(width, height) => {
+                command = Command::batch(vec![
+                    command,
+                    window::resize(iced::Size::new(width as u32, height as u32))
+                ]);
+                
+                self.terminal_content.push(format!("Resizing window to {}x{}", width, height).to_string());
+                
+                // Scroll to make this information visible
+                command = Command::batch(vec![
+                    command,
+                    Command::perform(
+                        async { () },
+                        |_| Message::ScrollToExact(1.0)
+                    )
+                ]);
+            }
+            
+
+            Message::KeyPressed(key_code, modifiers) => {
+                // Handle keyboard input
+                match key_code {
+                    // Window resizing with Ctrl+Shift+Arrow keys
+                    keyboard::KeyCode::Up if modifiers.shift() && modifiers.control() => {
+                        // Decrease height by 50px
+                        command = Command::perform(
+                            async { () },
+                            |_| Message::ResizeWindow(800, 550)
+                        );
+                    }
+                    keyboard::KeyCode::Down if modifiers.shift() && modifiers.control() => {
+                        // Increase height by 50px
+                        command = Command::perform(
+                            async { () },
+                            |_| Message::ResizeWindow(800, 650)
+                        );
+                    }
+                    keyboard::KeyCode::Left if modifiers.shift() && modifiers.control() => {
+                        // Decrease width by 50px
+                        command = Command::perform(
+                            async { () },
+                            |_| Message::ResizeWindow(750, 600)
+                        );
+                    }
+                    keyboard::KeyCode::Right if modifiers.shift() && modifiers.control() => {
+                        // Increase width by 50px
+                        command = Command::perform(
+                            async { () },
+                            |_| Message::ResizeWindow(850, 600)
+                        );
+                    }
+                
+                    // F1-F4 keys for quick terminal focus (keep for compatibility)
+                    keyboard::KeyCode::F1 => {
+                        // Save current cursor position
+                        self.save_current_cursor_position();
+                        
+                        // Primary terminal
+                        self.focused_terminal = 0;
+                        self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                        self.terminal_content.push("Focus set to Primary Terminal".to_string());
+                        // Don't force scroll for focus changes
+                        self.scroll_to_bottom = false;
+                    }
+                    keyboard::KeyCode::F2 => {
+                        // Secondary terminal 1
+                        if self.layout != TerminalLayout::Single {
+                            // Save current cursor position
+                            self.save_current_cursor_position();
+                            
+                            self.focused_terminal = 1;
+                            self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                            self.terminal_content.push("Focus set to Secondary Terminal 1".to_string());
+                            // Don't force scroll for focus changes
+                            self.scroll_to_bottom = false;
+                        }
+                    }
+                    keyboard::KeyCode::F3 => {
+                        // Secondary terminal 2 (only in grid layout)
+                        if self.layout == TerminalLayout::Grid {
+                            // Save current cursor position
+                            self.save_current_cursor_position();
+                            
+                            self.focused_terminal = 2;
+                            self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                            self.terminal_content.push("Focus set to Secondary Terminal 2".to_string());
+                            // Don't force scroll for focus changes
+                            self.scroll_to_bottom = false;
+                        }
+                    }
+                    keyboard::KeyCode::F4 => {
+                        // Secondary terminal 3 (only in grid layout)
+                        if self.layout == TerminalLayout::Grid {
+                            // Save current cursor position
+                            self.save_current_cursor_position();
+                            
+                            self.focused_terminal = 3;
+                            self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                            self.terminal_content.push("Focus set to Secondary Terminal 3".to_string());
+                            // Don't force scroll for focus changes
+                            self.scroll_to_bottom = false;
+                        }
+                    }
+                    
+                    // Arrow key navigation between terminals - NO MODIFIER NEEDED
+                    keyboard::KeyCode::Left if !modifiers.shift() => {
+                        // Always try to navigate between terminals first
+                        if self.layout == TerminalLayout::Single {
+                            // In single terminal, arrows are used for cursor movement
+                            // Do nothing special here
+                        } else {
+                            // Save cursor position of current terminal before navigation
+                            self.save_current_cursor_position();
+                            
+                            // Navigate left between terminals
+                            if self.layout == TerminalLayout::VerticalSplit {
+                                // In vertical split, left arrow goes to primary (left) terminal
+                                self.focused_terminal = 0;
+                                self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                                self.terminal_content.push("Focus set to Left Terminal".to_string());
+                            } else if self.layout == TerminalLayout::Grid {
+                                // In grid layout, cycle between terminals
+                                match self.focused_terminal {
+                                    1 => self.focused_terminal = 0, // Top-right to top-left
+                                    3 => self.focused_terminal = 2, // Bottom-right to bottom-left
+                                    _ => {} // No change for others
+                                }
+                                self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                                self.terminal_content.push(format!("Focus set to Terminal {}", self.focused_terminal + 1));
+                            }
+                            self.scroll_to_bottom = false;
+                        }
+                    }
+                    keyboard::KeyCode::Right if !modifiers.shift() => {
+                        // Always try to navigate between terminals first
+                        if self.layout == TerminalLayout::Single {
+                            // In single terminal, arrows are used for cursor movement
+                            // Do nothing special here
+                        } else {
+                            // Save cursor position of current terminal before navigation
+                            self.save_current_cursor_position();
+                            
+                            // Navigate right between terminals
+                            if self.layout == TerminalLayout::VerticalSplit {
+                                // In vertical split, right arrow goes to secondary (right) terminal
+                                self.focused_terminal = 1;
+                                self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                                self.terminal_content.push("Focus set to Right Terminal".to_string());
+                            } else if self.layout == TerminalLayout::Grid {
+                                // In grid layout, cycle between terminals
+                                match self.focused_terminal {
+                                    0 => self.focused_terminal = 1, // Top-left to top-right
+                                    2 => self.focused_terminal = 3, // Bottom-left to bottom-right
+                                    _ => {} // No change for others
+                                }
+                                self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                                self.terminal_content.push(format!("Focus set to Terminal {}", self.focused_terminal + 1));
+                            }
+                            self.scroll_to_bottom = false;
+                        }
+                    }
+                    keyboard::KeyCode::Up if !modifiers.shift() => {
+                        // Always try to navigate between terminals first
+                        if self.layout == TerminalLayout::Single {
+                            // In single terminal, arrows are used for cursor movement
+                            // Do nothing special here
+                        } else {
+                            // Save cursor position of current terminal before navigation
+                            self.save_current_cursor_position();
+                            
+                            // Navigate up between terminals
+                            if self.layout == TerminalLayout::HorizontalSplit {
+                                // In horizontal split, up arrow goes to primary (top) terminal
+                                self.focused_terminal = 0;
+                                self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                                self.terminal_content.push("Focus set to Top Terminal".to_string());
+                            } else if self.layout == TerminalLayout::Grid {
+                                // In grid layout, cycle between terminals
+                                match self.focused_terminal {
+                                    2 => self.focused_terminal = 0, // Bottom-left to top-left
+                                    3 => self.focused_terminal = 1, // Bottom-right to top-right
+                                    _ => {} // No change for others
+                                }
+                                self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                                self.terminal_content.push(format!("Focus set to Terminal {}", self.focused_terminal + 1));
+                            }
+                            self.scroll_to_bottom = false;
+                        }
+                    }
+                    keyboard::KeyCode::Down if !modifiers.shift() => {
+                        // Always try to navigate between terminals first
+                        if self.layout == TerminalLayout::Single {
+                            // In single terminal, arrows are used for cursor movement
+                            // Do nothing special here
+                        } else {
+                            // Save cursor position of current terminal before navigation
+                            self.save_current_cursor_position();
+                            
+                            // Navigate down between terminals
+                            if self.layout == TerminalLayout::HorizontalSplit {
+                                // In horizontal split, down arrow goes to secondary (bottom) terminal
+                                self.focused_terminal = 1;
+                                self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                                self.terminal_content.push("Focus set to Bottom Terminal".to_string());
+                            } else if self.layout == TerminalLayout::Grid {
+                                // In grid layout, cycle between terminals
+                                match self.focused_terminal {
+                                    0 => self.focused_terminal = 2, // Top-left to bottom-left
+                                    1 => self.focused_terminal = 3, // Top-right to bottom-right
+                                    _ => {} // No change for others
+                                }
+                                self.ensure_input_focus(); // Ensure input is focused in the new terminal
+                                self.terminal_content.push(format!("Focus set to Terminal {}", self.focused_terminal + 1));
+                            }
+                            self.scroll_to_bottom = false;
+                        }
+                    }
+                    keyboard::KeyCode::Enter => {
+                        // Execute command in the focused terminal
+                        match self.focused_terminal {
+                            0 => {
+                                // Primary terminal
+                                if let Some(last) = self.terminal_content.last().cloned() {
+                                    if last.starts_with("neo@matrix") {
+                                        let cmd_text = last["neo@matrix:~$ ".len()..].trim();
+                                        if !cmd_text.is_empty() {
+                                            // Add command output
+                                            self.terminal_content.push(format!("Executing: {}", cmd_text));
+                                            
+                                            // Handle different commands
+                                            match cmd_text {
+                                        "matrix" => {
+                                            // Matrix command does exactly the same as grid layout
+                                            // Just call the same code as in "grid" command
+                                            self.terminal_content.push("Arranging terminals in grid layout...".to_string());
+                                            
+                                            // Actually change the layout to grid
+                                            self.layout = TerminalLayout::Grid;
+                                            
+                                            // Ensure all secondary terminals have content
+                                            while self.secondary_terminals.len() < 3 {
+                                                let terminal_index = self.secondary_terminals.len() + 2;
+                                                let default_content = vec![
+                                                    "".to_string(),
+                                                    format!("Terminal {} initialized", terminal_index),
+                                                    "".to_string(),
+                                                    "neo@matrix:~$ ".to_string(),
+                                                ];
+                                                self.secondary_terminals.push(default_content);
+                                            }
+                                            
+                                            // Set focus to top-right terminal
+                                            self.focused_terminal = 1; 
+                                            
+                                            self.terminal_content.push("Terminals arranged in grid layout.".to_string());
+                                            self.terminal_content.push("4 terminals in a 2x2 grid configuration.".to_string());
+                                            self.terminal_content.push("Focus set to top-right terminal.".to_string());
+                                        },
+                                        "clear" => {
+                                            self.terminal_content.clear();
+                                            
+                                            // Create the centered title header
+                                            let terminal_width: usize = 80; // Standard terminal width
+                                            let title = format!(" THE MATRIX {} ", VERSION);
+                                            let fill_char = '═';
+                                            
+                                            // Calculate padding to center the title
+                                            let remaining_width = terminal_width.saturating_sub(title.len());
+                                            let left_pad = remaining_width / 2;
+                                            let right_pad = remaining_width - left_pad;
+                                            
+                                            // Create the centered title with fill characters on both sides
+                                            let header = format!(
+                                                "{}{}{}",
+                                                fill_char.to_string().repeat(left_pad),
+                                                title,
+                                                fill_char.to_string().repeat(right_pad)
+                                            );
+                                            
+                                            // Add the header after clearing
+                                            self.terminal_content.push("".to_string());
+                                            self.terminal_content.push(header);
+                                            self.terminal_content.push("".to_string());
+                                        },
+                                        "help" => {
+                                            self.terminal_content.push("Matrix Terminal Commands:".to_string());
+                                            self.terminal_content.push("--------------------------------------------------".to_string());
+                                            self.terminal_content.push("matrix          - Display the Matrix falling code effect".to_string());
+                                            self.terminal_content.push("clear           - Clear the terminal screen".to_string());
+                                            self.terminal_content.push("help            - Show this help message".to_string());
+                                            self.terminal_content.push("about           - Show information about Matrix Terminal".to_string());
+                                            self.terminal_content.push("".to_string());
+                                            self.terminal_content.push("Layout Commands:".to_string());
+                                            self.terminal_content.push("--------------------------------------------------".to_string());
+                                            self.terminal_content.push("split           - Show split menu (horizontal/vertical)".to_string());
+                                            self.terminal_content.push("h               - Split terminal horizontally (after 'split')".to_string());
+                                            self.terminal_content.push("v               - Split terminal vertically (after 'split')".to_string());
+                                            self.terminal_content.push("split-h         - Split terminal horizontally (shortcut)".to_string());
+                                            self.terminal_content.push("split-v         - Split terminal vertically (shortcut)".to_string());
+                                            self.terminal_content.push("grid            - Arrange terminals in a 2x2 grid layout".to_string());
+                                            self.terminal_content.push("zoom            - Toggle zoom on current terminal".to_string());
+                                            self.terminal_content.push("new             - Instructions for creating a new window".to_string());
+                                            self.terminal_content.push("".to_string());
+                                            self.terminal_content.push("Other Commands:".to_string());
+                                            self.terminal_content.push("--------------------------------------------------".to_string());
+                                            self.terminal_content.push("whoami          - Display current user information".to_string());
+                                            self.terminal_content.push("ls              - List simulated directory contents".to_string());
+                                            self.terminal_content.push("rebuild         - Rebuild and restart the application".to_string());
+                                            self.terminal_content.push("--------------------------------------------------".to_string());
+                                            
+                                            // Add keyboard shortcuts with better explanation
+                                            self.terminal_content.push("".to_string());
+                                            self.terminal_content.push("Keyboard Shortcuts:".to_string());
+                                            self.terminal_content.push("--------------------------------------------------".to_string());
+                                            self.terminal_content.push("Terminal Navigation:".to_string());
+                                            self.terminal_content.push("Arrow keys      - Navigate between split terminals".to_string());
+                                            self.terminal_content.push("F1              - Focus primary terminal (top-left in grid)".to_string());
+                                            self.terminal_content.push("F2              - Focus second terminal (top-right in grid)".to_string());
+                                            self.terminal_content.push("F3              - Focus third terminal (bottom-left in grid)".to_string());
+                                            self.terminal_content.push("F4              - Focus fourth terminal (bottom-right in grid)".to_string());
+                                            self.terminal_content.push("".to_string());
+                                            self.terminal_content.push("Window Resizing:".to_string());
+                                            self.terminal_content.push("Ctrl+Shift+↑    - Decrease window height".to_string());
+                                            self.terminal_content.push("Ctrl+Shift+↓    - Increase window height".to_string());
+                                            self.terminal_content.push("Ctrl+Shift+←    - Decrease window width".to_string());
+                                            self.terminal_content.push("Ctrl+Shift+→    - Increase window width".to_string());
+                                            self.terminal_content.push("--------------------------------------------------".to_string());
+                                            self.terminal_content.push(format!("Current version: {}", VERSION));
+                                        },
+                                        "about" => {
+                                            self.terminal_content.push(format!("Matrix Terminal {}", VERSION));
+                                            self.terminal_content.push("--------------------------------------------------".to_string());
+                                            self.terminal_content.push("A Matrix-themed terminal multiplexer built with Rust.".to_string());
+                                            self.terminal_content.push("Features:".to_string());
+                                            self.terminal_content.push("  - Matrix-style green-on-black theme".to_string());
+                                            self.terminal_content.push("  - Terminal multiplexing with split views".to_string());
+                                            self.terminal_content.push("  - Customizable layout presets".to_string());
+                                            self.terminal_content.push("  - Keyboard shortcuts (F1-F4) for navigation".to_string());
+                                            self.terminal_content.push("  - Dock integration and auto-updates".to_string());
+                                            self.terminal_content.push("--------------------------------------------------".to_string());
+                                            self.terminal_content.push("Type 'help' for available commands".to_string());
+                                        },
+                                        "rebuild" => {
+                                            self.terminal_content.push("Rebuilding Matrix Terminal application...".to_string());
+                                            self.terminal_content.push("This will close the current instance and reopen after rebuild.".to_string());
+                                            self.terminal_content.push("Executing rebuild script...".to_string());
+                                            
+                                            // Use Command::perform to run after terminal update
+                                            command = Command::perform(
+                                                async { () },
+                                                |_| {
+                                                    // This uses std::process to execute the rebuild script
+                                                    if let Ok(mut child) = std::process::Command::new("bash")
+                                                        .arg("-c")
+                                                        .arg("/Users/joshkornreich/Documents/Projects/Terminal/Matrix/rebuild.sh")
+                                                        .spawn() {
+                                                        // Exit this application to avoid having two instances running
+                                                        std::process::exit(0);
+                                                    }
+                                                    
+                                                    // If we couldn't run the script, just keep running
+                                                    Message::Tick
+                                                }
+                                            );
+                                        },
+                                        "new" | "new-window" => {
+                                            self.terminal_content.push("Creating new terminal window...".to_string());
+                                            
+                                            // Execute the shell command to open a new instance
+                                            self.terminal_content.push("To create a new Matrix Terminal window, run this command:".to_string());
+                                            self.terminal_content.push("$ open /Users/joshkornreich/Documents/Projects/Terminal/Matrix/matrix-gui/target/release/matrix_simple_gui".to_string());
+                                            self.terminal_content.push("".to_string());
+                                            self.terminal_content.push("⚠️ Note: External window creation isn't yet implemented in this prototype.".to_string());
+                                            self.terminal_content.push("Instead, you can use window splitting:".to_string());
+                                            self.terminal_content.push("  - Type 'split' to split the current terminal".to_string());
+                                            self.terminal_content.push("  - Use F1,F2,F3,F4 to switch between terminal panes".to_string());
+                                            self.terminal_content.push("  - Type 'zoom' to focus on the current terminal".to_string());
+                                            
+                                            // Queue the message for effect, but it will just show an info message
+                                            command = Command::batch(vec![
+                                                command,
+                                                Command::perform(
+                                                    async { () }, 
+                                                    |_| Message::NewWindow
+                                                )
+                                            ]);
+                                        },
+                                        "split" => {
+                                            // Show a simple menu for split direction
+                                            self.terminal_content.push("Choose split direction:".to_string());
+                                            self.terminal_content.push("h) horizontal".to_string());
+                                            self.terminal_content.push("v) vertical".to_string());
+                                            self.terminal_content.push("neo@matrix:~$ ".to_string());
+                                            self.cursor_position = "neo@matrix:~$ ".len();
+                                        },
+                                        "h" => {
+                                            // This is a response to the split menu
+                                            self.terminal_content.push("Splitting terminal horizontally...".to_string());
+                                            
+                                            // Actually change the layout to horizontal split (top/bottom)
+                                            self.layout = TerminalLayout::HorizontalSplit;
+                                            
+                                            // Ensure secondary terminal has content
+                                            if self.secondary_terminals.is_empty() {
+                                                let default_content = vec![
+                                                    "".to_string(),
+                                                    "╔══ MATRIX TERMINAL ════════════════════════════════════════════╗".to_string(),
+                                                    "╚═══════════════════════════════════════════════════════════════╝".to_string(),
+                                                    "neo@matrix:~$ ".to_string(),
+                                                ];
+                                                self.secondary_terminals.push(default_content);
+                                            }
+                                            
+                                            // Set focus to the new terminal
+                                            self.focused_terminal = 1;
+                                            
+                                            self.terminal_content.push("Terminal split horizontally.".to_string());
+                                            self.terminal_content.push("Top: Primary | Bottom: Secondary".to_string());
+                                            self.terminal_content.push("Focus set to Secondary Terminal".to_string());
+                                            self.terminal_content.push("Use F1/F2 to switch between terminals.".to_string());
+                                        },
+                                        "v" => {
+                                            // This is a response to the split menu
+                                            self.terminal_content.push("Splitting terminal vertically...".to_string());
+                                            
+                                            // Actually change the layout to vertical split (side by side)
+                                            self.layout = TerminalLayout::VerticalSplit;
+                                            
+                                            // Ensure secondary terminal has content
+                                            if self.secondary_terminals.is_empty() {
+                                                let default_content = vec![
+                                                    "".to_string(),
+                                                    "╔══ MATRIX TERMINAL ════════════════════════════════════════════╗".to_string(),
+                                                    "╚═══════════════════════════════════════════════════════════════╝".to_string(),
+                                                    "neo@matrix:~$ ".to_string(),
+                                                ];
+                                                self.secondary_terminals.push(default_content);
+                                            }
+                                            
+                                            // Set focus to the new terminal
+                                            self.focused_terminal = 1;
+                                            
+                                            self.terminal_content.push("Terminal split vertically.".to_string());
+                                            self.terminal_content.push("Left: Primary | Right: Secondary".to_string());
+                                            self.terminal_content.push("Focus set to Secondary Terminal".to_string());
+                                            self.terminal_content.push("Use F1/F2 to switch between terminals.".to_string());
+                                        },
+                                        "split-h" | "split horizontal" => {
+                                            self.terminal_content.push("Splitting terminal horizontally...".to_string());
+                                            
+                                            // Actually change the layout to horizontal split (top/bottom)
+                                            self.layout = TerminalLayout::HorizontalSplit;
+                                            
+                                            // Ensure secondary terminal has content
+                                            if self.secondary_terminals.is_empty() {
+                                                let default_content = vec![
+                                                    "".to_string(),
+                                                    "╔══ MATRIX TERMINAL ════════════════════════════════════════════╗".to_string(),
+                                                    "╚═══════════════════════════════════════════════════════════════╝".to_string(),
+                                                    "neo@matrix:~$ ".to_string(),
+                                                ];
+                                                self.secondary_terminals.push(default_content);
+                                            }
+                                            
+                                            // Set focus to the new terminal
+                                            self.focused_terminal = 1;
+                                            
+                                            self.terminal_content.push("Terminal split horizontally.".to_string());
+                                            self.terminal_content.push("Top: Primary | Bottom: Secondary".to_string());
+                                            self.terminal_content.push("Focus set to Secondary Terminal".to_string());
+                                            self.terminal_content.push("Use F1/F2 to switch between terminals.".to_string());
+                                        },
+                                        "split-v" | "split vertical" => {
+                                            self.terminal_content.push("Splitting terminal vertically...".to_string());
+                                            
+                                            // Actually change the layout to vertical split (side by side)
+                                            self.layout = TerminalLayout::VerticalSplit;
+                                            
+                                            // Ensure secondary terminal has content
+                                            if self.secondary_terminals.is_empty() {
+                                                let default_content = vec![
+                                                    "".to_string(),
+                                                    "╔══ MATRIX TERMINAL ════════════════════════════════════════════╗".to_string(),
+                                                    "╚═══════════════════════════════════════════════════════════════╝".to_string(),
+                                                    "neo@matrix:~$ ".to_string(),
+                                                ];
+                                                self.secondary_terminals.push(default_content);
+                                            }
+                                            
+                                            // Set focus to the new terminal
+                                            self.focused_terminal = 1;
+                                            
+                                            self.terminal_content.push("Terminal split vertically.".to_string());
+                                            self.terminal_content.push("Left: Primary | Right: Secondary".to_string());
+                                            self.terminal_content.push("Focus set to Secondary Terminal".to_string());
+                                            self.terminal_content.push("Use F1/F2 to switch between terminals.".to_string());
+                                        },
+                                        "grid" => {
+                                            self.terminal_content.push("Arranging terminals in grid layout...".to_string());
+                                            
+                                            // Actually change the layout to grid
+                                            self.layout = TerminalLayout::Grid;
+                                            
+                                            // Ensure all secondary terminals have content
+                                            while self.secondary_terminals.len() < 3 {
+                                                let terminal_index = self.secondary_terminals.len() + 2;
+                                                let default_content = vec![
+                                                    "".to_string(),
+                                                    format!("Terminal {} initialized", terminal_index),
+                                                    "".to_string(),
+                                                    "neo@matrix:~$ ".to_string(),
+                                                ];
+                                                self.secondary_terminals.push(default_content);
+                                            }
+                                            
+                                            // Set focus to top-right terminal
+                                            self.focused_terminal = 1; 
+                                            
+                                            self.terminal_content.push("Terminals arranged in grid layout.".to_string());
+                                            self.terminal_content.push("4 terminals in a 2x2 grid configuration.".to_string());
+                                            self.terminal_content.push("Focus set to top-right terminal.".to_string());
+                                        },
+                                        "zoom" => {
+                                            self.terminal_content.push("Zooming current terminal...".to_string());
+                                            
+                                            // Check current layout state
+                                            let prev_layout = self.layout.clone();
+                                            
+                                            if let TerminalLayout::Zoomed(_) = prev_layout {
+                                                // We're already zoomed, so go back to previous layout
+                                                self.layout = TerminalLayout::Single;
+                                                self.terminal_content.push("Unzoomed to normal view.".to_string());
+                                            } else {
+                                                // Zoom the primary terminal (index 0)
+                                                self.layout = TerminalLayout::Zoomed(0);
+                                                self.terminal_content.push("Terminal zoomed to full screen.".to_string());
+                                                self.terminal_content.push("Type 'zoom' again or click the 'Z' icon to unzoom.".to_string());
+                                            }
+                                        },
+                                        "whoami" => {
+                                            self.terminal_content.push("neo".to_string());
+                                            self.terminal_content.push("".to_string());
+                                            self.terminal_content.push("User: Neo (The One)".to_string());
+                                            self.terminal_content.push("Status: Connected to the Matrix".to_string());
+                                            self.terminal_content.push("Location: Nebuchadnezzar".to_string());
+                                            self.terminal_content.push("Mission: Free your mind".to_string());
+                                        },
+                                        "ls" => {
+                                            self.terminal_content.push("Listing directory contents:".to_string());
+                                            self.terminal_content.push("".to_string());
+                                            self.terminal_content.push("drwxr-xr-x   11 neo  crew   352 Apr 13 10:31 .".to_string());
+                                            self.terminal_content.push("drwxr-xr-x    5 neo  crew   160 Apr 13 01:29 ..".to_string());
+                                            self.terminal_content.push("-rw-r--r--    1 neo  crew   528 Apr 13 13:21 agents.txt".to_string());
+                                            self.terminal_content.push("drwxr-xr-x    3 neo  crew    96 Apr 13 15:20 bluepill".to_string());
+                                            self.terminal_content.push("-rw-r--r--    1 neo  crew  2517 Apr 13 18:01 matrix_code.bin".to_string());
+                                            self.terminal_content.push("drwxr-xr-x    7 neo  crew   224 Apr 13 09:42 redpill".to_string());
+                                            self.terminal_content.push("-rw-r--r--    1 neo  crew   843 Apr 13 11:56 the_oracle.log".to_string());
+                                            self.terminal_content.push("-rwxr-xr-x    1 neo  crew  1024 Apr 13 16:33 zion_mainframe.sys".to_string());
+                                        },
+                                        _ => {
+                                            self.terminal_content.push(format!("Command not found: {}", cmd_text));
+                                            self.terminal_content.push("Type 'help' for a list of available commands.".to_string());
+                                        }
+                                    }
+                                }
+                                
+                                // Add new prompt
+                                self.terminal_content.push("neo@matrix:~$ ".to_string());
+                                self.cursor_position = "neo@matrix:~$ ".len();
+                                
+                                // Use programmatic scrolling to show the latest output
+                                // 1.0 means scroll all the way to the bottom
+                                command = Command::batch(vec![
+                                    command,
+                                    Command::perform(
+                                        async { () },
+                                        |_| Message::ScrollToExact(1.0)
+                                    )
+                                ]);
+                            }
+                        }
+                    },
+                            n if n > 0 && n <= self.secondary_terminals.len() => {
+                                // Secondary terminal command execution
+                                let terminal_idx = n - 1;
+                                
+                                if let Some(terminal) = self.secondary_terminals.get_mut(terminal_idx) {
+                                    if let Some(last) = terminal.last().cloned() {
+                                        if last.starts_with("neo@matrix") {
+                                            let cmd_text = last["neo@matrix:~$ ".len()..].trim();
+                                            if !cmd_text.is_empty() {
+                                                // Add command output to this terminal
+                                                terminal.push(format!("Executing: {}", cmd_text));
+                                                
+                                                // Execute the command in this terminal (support all commands)
+                                                match cmd_text {
+                                                    "clear" => {
+                                                        // Clear the terminal but keep the header
+                                                        terminal.clear();
+                                                        
+                                                        // Create the centered title header
+                                                        let terminal_width: usize = 80; // Standard terminal width
+                                                        let title = format!(" THE MATRIX {} ", VERSION);
+                                                        let fill_char = '═';
+                                                        
+                                                        // Calculate padding to center the title
+                                                        let remaining_width = terminal_width.saturating_sub(title.len());
+                                                        let left_pad = remaining_width / 2;
+                                                        let right_pad = remaining_width - left_pad;
+                                                        
+                                                        // Create the centered title with fill characters on both sides
+                                                        let header = format!(
+                                                            "{}{}{}",
+                                                            fill_char.to_string().repeat(left_pad),
+                                                            title,
+                                                            fill_char.to_string().repeat(right_pad)
+                                                        );
+                                                        
+                                                        // Add the header after clearing
+                                                        terminal.push("".to_string());
+                                                        terminal.push(header);
+                                                        terminal.push("".to_string());
+                                                    },
+                                                    "whoami" => {
+                                                        terminal.push("neo".to_string());
+                                                        terminal.push("".to_string());
+                                                        terminal.push("User: Neo (The One)".to_string());
+                                                        terminal.push("Status: Connected to the Matrix".to_string());
+                                                        terminal.push("Location: Nebuchadnezzar".to_string());
+                                                        terminal.push("Mission: Free your mind".to_string());
+                                                    },
+                                                    "help" => {
+                                                        terminal.push("Matrix Terminal Commands:".to_string());
+                                                        terminal.push("--------------------------------------------------".to_string());
+                                                        terminal.push("matrix          - Display the Matrix falling code effect".to_string());
+                                                        terminal.push("clear           - Clear the terminal screen".to_string());
+                                                        terminal.push("help            - Show this help message".to_string());
+                                                        terminal.push("about           - Show information about Matrix Terminal".to_string());
+                                                        terminal.push("".to_string());
+                                                        terminal.push("Layout Commands:".to_string());
+                                                        terminal.push("--------------------------------------------------".to_string());
+                                                        terminal.push("split           - Show split menu (horizontal/vertical)".to_string());
+                                                        terminal.push("h               - Split terminal horizontally (after 'split')".to_string());
+                                                        terminal.push("v               - Split terminal vertically (after 'split')".to_string());
+                                                        terminal.push("grid            - Arrange terminals in a 2x2 grid layout".to_string());
+                                                        terminal.push("zoom            - Toggle zoom on current terminal".to_string());
+                                                        terminal.push("--------------------------------------------------".to_string());
+                                                        terminal.push(format!("Current version: {}", VERSION));
+                                                    },
+                                                    "about" => {
+                                                        terminal.push(format!("Matrix Terminal {}", VERSION));
+                                                        terminal.push("--------------------------------------------------".to_string());
+                                                        terminal.push("A Matrix-themed terminal multiplexer built with Rust.".to_string());
+                                                        terminal.push("Features:".to_string());
+                                                        terminal.push("  - Matrix-style green-on-black theme".to_string());
+                                                        terminal.push("  - Terminal multiplexing with split views".to_string());
+                                                        terminal.push("  - Customizable layout presets".to_string());
+                                                        terminal.push("  - Keyboard shortcuts (F1-F4) for navigation".to_string());
+                                                    },
+                                                    "matrix" | "grid" => {
+                                                        terminal.push("Grid layout command was executed in the main terminal.".to_string());
+                                                        terminal.push("The main terminal controls the layout of all terminals.".to_string());
+                                                    },
+                                                    "split" | "h" | "v" | "split-h" | "split-v" | "zoom" => {
+                                                        terminal.push("Layout command was executed in the main terminal.".to_string());
+                                                        terminal.push("The main terminal controls the layout of all terminals.".to_string());
+                                                    },
+                                                    cmd if cmd.starts_with("echo") => {
+                                                        // Echo the input after "echo "
+                                                        if cmd.len() > 5 {
+                                                            terminal.push(cmd[5..].to_string());
+                                                        } else {
+                                                            terminal.push("".to_string());
+                                                        }
+                                                    },
+                                                    "ls" => {
+                                                        terminal.push("Listing directory contents:".to_string());
+                                                        terminal.push("".to_string());
+                                                        terminal.push("drwxr-xr-x   11 neo  crew   352 Apr 13 10:31 .".to_string());
+                                                        terminal.push("drwxr-xr-x    5 neo  crew   160 Apr 13 01:29 ..".to_string());
+                                                        terminal.push("-rw-r--r--    1 neo  crew   528 Apr 13 13:21 agents.txt".to_string());
+                                                        terminal.push("drwxr-xr-x    3 neo  crew    96 Apr 13 15:20 bluepill".to_string());
+                                                        terminal.push("-rw-r--r--    1 neo  crew  2517 Apr 13 18:01 matrix_code.bin".to_string());
+                                                        terminal.push("drwxr-xr-x    7 neo  crew   224 Apr 13 09:42 redpill".to_string());
+                                                    },
+                                                    "rebuild" => {
+                                                        terminal.push("Rebuilding command should be executed in the main terminal.".to_string());
+                                                    },
+                                                    _ => {
+                                                        // Default response for unrecognized commands
+                                                        terminal.push(format!("Command not recognized: {}", cmd_text));
+                                                        terminal.push("Type 'help' for a list of available commands.".to_string());
+                                                    }
+                                                }
+                                                
+                                                // Add new prompt
+                                                terminal.push("neo@matrix:~$ ".to_string());
+                                                
+                                                // Update the cursor position for this terminal
+                                                if terminal_idx < self.secondary_cursors.len() {
+                                                    self.secondary_cursors[terminal_idx] = "neo@matrix:~$ ".len();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            _ => {
+                                // Invalid terminal index, do nothing
+                            }
+                        }
+                    }
+                    
+                    keyboard::KeyCode::Backspace => {
+                        // Handle backspace according to which terminal is focused
+                        match self.focused_terminal {
+                            0 => {
+                                // Primary terminal - delete from primary terminal content
+                                if let Some(last) = self.terminal_content.last_mut() {
+                                    if last.starts_with("neo@matrix") && last.len() > "neo@matrix:~$ ".len() {
+                                        last.pop();
+                                        self.cursor_position = last.len();
+                                        
+                                        // Use programmatic scrolling to keep cursor visible
+                                        // Scroll to the very bottom whenever deleting
+                                        command = Command::batch(vec![
+                                            command,
+                                            Command::perform(
+                                                async { () },
+                                                |_| Message::ScrollToExact(1.0)
+                                            )
+                                        ]);
+                                    }
+                                }
+                            },
+                            n if n > 0 && n <= self.secondary_terminals.len() => {
+                                // Secondary terminal - delete from the correct secondary terminal
+                                let terminal_idx = n - 1;
+                                
+                                if let Some(terminal) = self.secondary_terminals.get_mut(terminal_idx) {
+                                    if let Some(last) = terminal.last_mut() {
+                                        if last.starts_with("neo@matrix") && last.len() > "neo@matrix:~$ ".len() {
+                                            last.pop();
+                                            
+                                            // Update cursor position for this terminal
+                                            if terminal_idx < self.secondary_cursors.len() {
+                                                self.secondary_cursors[terminal_idx] = last.len();
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            _ => {
+                                // Invalid terminal index, do nothing
+                            }
+                        }
+                    }
+                    
+                    // Handle character input
+                    _ => {
+                        if let Some(c) = key_to_char(key_code, modifiers) {
+                            match self.focused_terminal {
+                                0 => {
+                                    // Primary terminal - add character to primary terminal content
+                                    if let Some(last) = self.terminal_content.last_mut() {
+                                        if last.starts_with("neo@matrix") {
+                                            last.push(c);
+                                            self.cursor_position = last.len();
+                                            
+                                            // Use programmatic scrolling to keep cursor visible
+                                            // Scroll to the very bottom whenever typing
+                                            command = Command::batch(vec![
+                                                command,
+                                                Command::perform(
+                                                    async { () },
+                                                    |_| Message::ScrollToExact(1.0)
+                                                )
+                                            ]);
+                                        }
+                                    }
+                                },
+                                n if n > 0 && n <= self.secondary_terminals.len() => {
+                                    // Secondary terminal - add character to the correct secondary terminal
+                                    let terminal_idx = n - 1;
+                                    
+                                    if let Some(terminal) = self.secondary_terminals.get_mut(terminal_idx) {
+                                        if let Some(last) = terminal.last_mut() {
+                                            if last.starts_with("neo@matrix") {
+                                                last.push(c);
+                                                
+                                                // Update cursor position for this terminal
+                                                if terminal_idx < self.secondary_cursors.len() {
+                                                    self.secondary_cursors[terminal_idx] = last.len();
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                _ => {
+                                    // Invalid terminal index, do nothing
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            Message::Tick => {
+                // Blink the cursor
+                let now = Instant::now();
+                if now.duration_since(self.cursor_blink_timer) >= Duration::from_millis(500) {
+                    self.cursor_visible = !self.cursor_visible;
+                    self.cursor_blink_timer = now;
+                }
+                
+                // Check if we need to show the intro animation
+                if self.show_intro_animation {
+                    self.show_intro_animation = false; // Only show once
+                    
+                    // Clear the current content
+                    self.terminal_content.clear();
+                    
+                    // Matrix quotes for the animation
+                    let quotes = [
+                        "Wake up, Neo...",
+                        "The Matrix has you...",
+                        "Follow the white rabbit.",
+                        "Knock, knock, Neo.",
+                    ];
+                    
+                    // Create a short Matrix-style falling code animation
+                    for i in 0..5 {
+                        // Start with random chars
+                        let mut chars: String = (0..40)
+                            .map(|_| {
+                                let r = self.rng.gen::<u8>() % 94;
+                                (r + 33) as char
+                            })
+                            .collect();
+                        
+                        // Insert a Matrix quote
+                        if i == 2 {
+                            let quote = quotes[self.rng.gen_range(0..quotes.len())];
+                            let padding = (40 - quote.len()) / 2;
+                            if padding > 0 && quote.len() + padding <= 40 {
+                                chars = format!("{:>width$}{}", "", quote, width = padding);
+                                // Pad with Matrix chars
+                                while chars.len() < 40 {
+                                    chars.push((self.rng.gen::<u8>() % 94 + 33) as char);
+                                }
+                            }
+                        }
+                        
+                        self.terminal_content.push(chars);
+                    }
+                    
+                    // Add a header that spans the width of the terminal
+                    self.terminal_content.push("".to_string());
+                    
+                    // Calculate approximate width based on terminal size
+                    // For a clean display, we'll use a fixed width rather than try to detect exact terminal width
+                    let terminal_width = 80; // Standard terminal width
+                    
+                    // Create a title with version that's centered
+                    let title = format!(" THE MATRIX {} ", VERSION);
+                    let fill_char = '═';
+                    
+                    // Calculate padding to center the title
+                    let remaining_width = terminal_width.saturating_sub(title.len());
+                    let left_pad = remaining_width / 2;
+                    let right_pad = remaining_width - left_pad;
+                    
+                    // Create the centered title with fill characters on both sides
+                    let header = format!(
+                        "{}{}{}",
+                        fill_char.to_string().repeat(left_pad),
+                        title,
+                        fill_char.to_string().repeat(right_pad)
+                    );
+                    
+                    self.terminal_content.push(header);
+                    self.terminal_content.push("".to_string());
+                    self.terminal_content.push("neo@matrix:~$ ".to_string());
+                    self.cursor_position = "neo@matrix:~$ ".len();
+                    
+                    // Force scroll to bottom to show the new content
+                    self.scroll_to_bottom = true;
+                }
+                
+                self.last_update = now;
+            }
+        }
+        
+        command
+    }
+
+    fn view(&self) -> Element<Message> {
+        // Create the sidebar
+        let sidebar = self.view_sidebar();
+        
+        // Create the main content area based on the current layout
+        let main_content = match self.layout {
+            TerminalLayout::Single => {
+                // Single terminal layout
+                let terminal = self.view_terminal();
+                let is_focused = self.focused_terminal == 0;
+                
+                // We can't make the container clickable directly, so we'll just style it
+                container(terminal)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(theme::Container::Custom(Box::new(TerminalStyle { focused: is_focused })))
+            },
+            TerminalLayout::HorizontalSplit => {
+                // Horizontal split (top/bottom)
+                let primary_terminal = self.view_terminal();
+                
+                // Create the secondary terminal
+                let secondary_terminal = if !self.secondary_terminals.is_empty() {
+                    self.view_secondary_terminal(0)
+                } else {
+                    // Fallback in case no secondary terminals exist
+                    self.view_terminal()
+                };
+                
+                // Determine which terminals are focused
+                let primary_focused = self.focused_terminal == 0;
+                let secondary_focused = self.focused_terminal == 1;
+                
+                // Arrange terminals in a vertical column
+                let split_content = column![
+                    container(primary_terminal)
+                        .width(Length::Fill)
+                        .height(Length::FillPortion(1))
+                        .style(theme::Container::Custom(Box::new(TerminalStyle { focused: primary_focused }))),
+                    container(secondary_terminal)
+                        .width(Length::Fill)
+                        .height(Length::FillPortion(1))
+                        .style(theme::Container::Custom(Box::new(TerminalStyle { focused: secondary_focused }))),
+                ];
+                
+                container(split_content)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+            },
+            TerminalLayout::VerticalSplit => {
+                // Vertical split (left/right)
+                let primary_terminal = self.view_terminal();
+                
+                // Create the secondary terminal
+                let secondary_terminal = if !self.secondary_terminals.is_empty() {
+                    self.view_secondary_terminal(0)
+                } else {
+                    // Fallback in case no secondary terminals exist
+                    self.view_terminal()
+                };
+                
+                // Determine which terminals are focused
+                let primary_focused = self.focused_terminal == 0;
+                let secondary_focused = self.focused_terminal == 1;
+                
+                // Arrange terminals in a horizontal row
+                let split_content = row![
+                    container(primary_terminal)
+                        .width(Length::FillPortion(1))
+                        .height(Length::Fill)
+                        .style(theme::Container::Custom(Box::new(TerminalStyle { focused: primary_focused }))),
+                    container(secondary_terminal)
+                        .width(Length::FillPortion(1))
+                        .height(Length::Fill)
+                        .style(theme::Container::Custom(Box::new(TerminalStyle { focused: secondary_focused }))),
+                ];
+                
+                container(split_content)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+            },
+            TerminalLayout::Grid => {
+                // Grid layout (2x2)
+                let primary_terminal = self.view_terminal();
+                
+                // Determine which terminals are focused
+                let is_focused = |index: usize| self.focused_terminal == index;
+                
+                // Create the grid layout
+                let top_row = row![
+                    container(primary_terminal)
+                        .width(Length::FillPortion(1))
+                        .height(Length::Fill)
+                        .style(theme::Container::Custom(Box::new(TerminalStyle { focused: is_focused(0) }))),
+                    container(self.view_secondary_terminal(0))
+                        .width(Length::FillPortion(1))
+                        .height(Length::Fill)
+                        .style(theme::Container::Custom(Box::new(TerminalStyle { focused: is_focused(1) }))),
+                ];
+                
+                let bottom_row = row![
+                    container(self.view_secondary_terminal(1))
+                        .width(Length::FillPortion(1))
+                        .height(Length::Fill)
+                        .style(theme::Container::Custom(Box::new(TerminalStyle { focused: is_focused(2) }))),
+                    container(self.view_secondary_terminal(2))
+                        .width(Length::FillPortion(1))
+                        .height(Length::Fill)
+                        .style(theme::Container::Custom(Box::new(TerminalStyle { focused: is_focused(3) }))),
+                ];
+                
+                let grid_content = column![
+                    container(top_row)
+                        .width(Length::Fill)
+                        .height(Length::FillPortion(1)),
+                    container(bottom_row)
+                        .width(Length::Fill)
+                        .height(Length::FillPortion(1)),
+                ];
+                
+                container(grid_content)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+            },
+            TerminalLayout::Zoomed(index) => {
+                // Zoomed layout - just one terminal at full size
+                let terminal = if index == 0 || self.secondary_terminals.is_empty() {
+                    self.view_terminal()
+                } else {
+                    self.view_secondary_terminal(index - 1)
+                };
+                
+                container(terminal)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(theme::Container::Custom(Box::new(TerminalStyle { focused: true })))
+            }
+        };
+        
+        // Arrange sidebar and main content
+        let main_row = row![
+            sidebar,
+            main_content,
+        ];
+        
+        // Just use the main content directly without the version overlay
+        container(main_row)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::Container::Custom(Box::new(MatrixStyle)))
+            .into()
+    }
+}
+
+impl MatrixTerminal {
+    // Helper method to save cursor position of the currently focused terminal
+    fn save_current_cursor_position(&mut self) {
+        match self.focused_terminal {
+            0 => {
+                // Save the primary terminal cursor position
+                // Already stored in self.cursor_position, no need to do anything
+            },
+            n if n > 0 && n <= self.secondary_cursors.len() => {
+                // Save the secondary terminal cursor position
+                // Find the last prompt line to get the accurate cursor position
+                if let Some(terminal) = self.secondary_terminals.get(n - 1) {
+                    if let Some(last_line) = terminal.last() {
+                        if last_line.starts_with("neo@matrix") {
+                            // Store the cursor position at the end of the prompt
+                            self.secondary_cursors[n - 1] = last_line.len();
+                        }
+                    }
+                }
+            },
+            _ => {
+                // Invalid terminal index, do nothing
+            }
+        }
+    }
+    
+    // Helper method to ensure input focus on the selected terminal
+    fn ensure_input_focus(&mut self) {
+        // Reset cursor blinking for better visibility after switching terminals
+        self.cursor_visible = true;
+        self.cursor_blink_timer = Instant::now();
+        
+        match self.focused_terminal {
+            0 => {
+                // Ensure the primary terminal has a prompt line to focus on
+                if let Some(last) = self.terminal_content.last() {
+                    if !last.starts_with("neo@matrix") {
+                        // Add a prompt line if needed
+                        self.terminal_content.push("neo@matrix:~$ ".to_string());
+                    }
+                }
+                
+                // Set cursor to the end of the prompt line
+                self.cursor_position = if let Some(last) = self.terminal_content.last() {
+                    last.len()
+                } else {
+                    "neo@matrix:~$ ".len()
+                };
+            },
+            n if n > 0 && n <= self.secondary_terminals.len() => {
+                // Ensure the secondary terminal has a prompt line to focus on
+                let terminal_idx = n - 1;
+                if let Some(terminal) = self.secondary_terminals.get_mut(terminal_idx) {
+                    if let Some(last) = terminal.last() {
+                        if !last.starts_with("neo@matrix") {
+                            // Add a prompt line if needed
+                            terminal.push("neo@matrix:~$ ".to_string());
+                        }
+                    }
+                    
+                    // Set cursor to the end of the prompt line
+                    if terminal_idx < self.secondary_cursors.len() {
+                        self.secondary_cursors[terminal_idx] = if let Some(last) = terminal.last() {
+                            last.len()
+                        } else {
+                            "neo@matrix:~$ ".len()
+                        };
+                    }
+                }
+            },
+            _ => {
+                // Invalid terminal index, do nothing
+            }
+        }
+    }
+
+    // Method to render a secondary terminal
+    fn view_secondary_terminal<'a>(&'a self, index: usize) -> Element<'a, Message> {
+        // Make sure the index is valid
+        if index >= self.secondary_terminals.len() {
+            // Return an empty terminal if index is out of bounds
+            return column![
+                text("Terminal not available")
+                    .style(theme::Text::Color(MATRIX_GREEN))
+            ]
+            .spacing(5)
+            .padding(10)
+            .width(Length::Fill)
+            .align_items(iced::Alignment::Start)
+            .into();
+        }
+        
+        // Get the content for this secondary terminal
+        let terminal_content = &self.secondary_terminals[index];
+        
+        // Create a scrollable view with content
+        let mut terminal_column = column![]
+            .spacing(5)
+            .padding(10)
+            .width(Length::Fill)
+            .align_items(iced::Alignment::Start);
+        
+        // Check if this terminal is focused
+        let is_focused = self.focused_terminal == index + 1;
+        
+        // Add all terminal content lines
+        for (i, line) in terminal_content.iter().enumerate() {
+            let is_last_line = i == terminal_content.len() - 1;
+            
+            // Handle cursor display for the focused terminal
+            if is_focused && is_last_line && self.cursor_visible && line.starts_with("neo@matrix") {
+                // Get the cursor position for this terminal
+                let cursor_position = if index < self.secondary_cursors.len() {
+                    self.secondary_cursors[index]
+                } else {
+                    "neo@matrix:~$ ".len() // Default position
+                };
+                
+                // Make sure the cursor position is valid for this line
+                let cursor_position = cursor_position.min(line.len());
+                
+                // Split at cursor position
+                let (before, after) = line.split_at(cursor_position);
+                
+                // Add cursor character
+                let content_with_cursor = format!("{}█{}", before, after);
+                terminal_column = terminal_column.push(
+                    text(content_with_cursor).style(theme::Text::Color(MATRIX_GREEN))
+                );
+            } else {
+                // Regular line without cursor
+                let color = if line.starts_with("neo@matrix") {
+                    MATRIX_GREEN
+                } else if line.starts_with("Executing:") {
+                    DARK_GREEN
+                } else {
+                    MATRIX_GREEN
+                };
+                
+                terminal_column = terminal_column.push(
+                    text(line).style(theme::Text::Color(color))
+                );
+            }
+        }
+        
+        // Add an invisible spacer at the bottom to help with scrolling
+        terminal_column = terminal_column.push(vertical_space(1));
+        
+        // Create a scrollable area with an ID for programmatic scrolling
+        let scrollable_id = iced::widget::scrollable::Id::new(format!("terminal_scroll_{}", index));
+        
+        // Setup basic scrollbar properties
+        let props = iced::widget::scrollable::Properties::new()
+            .width(4)
+            .scroller_width(4)
+            .margin(1);
+            
+        // Use consistent behavior with the main terminal view
+        let scrollable = if self.scroll_to_bottom {
+            // Use alignment for initial setup or after commands 
+            let props = props.alignment(iced::widget::scrollable::Alignment::End);
+            
+            iced::widget::scrollable(terminal_column)
+                .id(scrollable_id)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .direction(iced::widget::scrollable::Direction::Vertical(props))
+        } else {
+            // No automatic behavior
+            iced::widget::scrollable(terminal_column)
+                .id(scrollable_id)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .direction(iced::widget::scrollable::Direction::Vertical(props))
+        };
+            
+        scrollable.into()
+    }
+    
+    fn view_sidebar<'a>(&'a self) -> Element<'a, Message> {
+        // Helper function to create a sidebar icon with hover effects
+        let create_icon = |icon: SidebarIcon, label: &str, _tooltip: &str, _shortcut: &str| {
+            // Use a button with hover styling defined in the IconButtonStyle
+            let button_style = theme::Button::Custom(Box::new(IconButtonStyle));
+            
+            // Create the button with the label
+            let icon_button = button(
+                text(label)
+                    .size(16)
+                    .horizontal_alignment(Horizontal::Center)
+                    .vertical_alignment(Vertical::Center)
+            )
+            .width(Length::Fixed(30.0))
+            .height(Length::Fixed(30.0))
+            .style(button_style)
+            .on_press(Message::SidebarIconClicked(icon));
+            
+            // Note: We'll implement proper tooltips in the future
+            // For now we're just passing tooltip and shortcut parameters for future use
+            
+            // Container for the button with spacing
+            container(icon_button)
+                .width(Length::Fixed(30.0))
+                .center_x()
+                .padding(2)
+        };
+        
+        let new_icon = create_icon(SidebarIcon::NewWindow, "N", "New Window", "Ctrl+N");
+        let h_split_icon = create_icon(SidebarIcon::SplitHorizontal, "H", "Split Horizontal", "Ctrl+H");
+        let v_split_icon = create_icon(SidebarIcon::SplitVertical, "V", "Split Vertical", "Ctrl+V");
+        let grid_icon = create_icon(SidebarIcon::GridLayout, "G", "Grid Layout", "Ctrl+G");
+        let zoom_icon = create_icon(SidebarIcon::Zoom, "Z", "Zoom Window", "Ctrl+Z");
+        let close_icon = create_icon(SidebarIcon::Close, "X", "Close Window", "Ctrl+W");
+        
+        // Size control buttons
+        let size_increase_icon = create_icon(SidebarIcon::SizeIncrease, "+", "Increase Size by 10%", "");
+        let size_decrease_icon = create_icon(SidebarIcon::SizeDecrease, "-", "Decrease Size by 10%", "");
+        
+        let sidebar = column![
+            vertical_space(5),
+            new_icon,
+            vertical_space(5),
+            h_split_icon,
+            vertical_space(5),
+            v_split_icon,
+            vertical_space(5),
+            grid_icon,
+            vertical_space(5),
+            zoom_icon,
+            vertical_space(5),
+            close_icon,
+            vertical_space(10),
+            // Add a small divider
+            container(
+                text("—")
+                    .size(12)
+                    .style(theme::Text::Color(DARK_GREEN))
+            )
+            .width(Length::Fixed(30.0))
+            .center_x()
+            .padding(2),
+            vertical_space(5),
+            // Size controls
+            size_increase_icon,
+            vertical_space(2),
+            size_decrease_icon,
+            vertical_space(5),
+        ]
+        .spacing(5)
+        .width(Length::Fixed(30.0))
+        .height(Length::Fill);
+        
+        container(sidebar)
+            .width(Length::Fixed(30.0))
+            .height(Length::Fill)
+            .style(theme::Container::Custom(Box::new(SidebarStyle)))
+            .into()
+    }
+    
+    fn view_terminal<'a>(&'a self) -> Element<'a, Message> {
+        // Create a scrollable view with content
+        let mut terminal_column = column![]
+            .spacing(5)
+            .padding(10)
+            .width(Length::Fill)
+            .align_items(iced::Alignment::Start);
+        
+        // Check if the primary terminal is focused
+        let is_focused = self.focused_terminal == 0;
+        
+        // Add all terminal content lines
+        for (i, line) in self.terminal_content.iter().enumerate() {
+            let is_last_line = i == self.terminal_content.len() - 1;
+            
+            if is_last_line && self.cursor_visible && is_focused {
+                // Show cursor on the last line ONLY when terminal is focused
+                if line.starts_with("neo@matrix") {
+                    // Make sure the cursor position is valid for this line
+                    let cursor_position = self.cursor_position.min(line.len());
+                    
+                    // Split at cursor position
+                    let (before, after) = line.split_at(cursor_position);
+                    
+                    // Add cursor character
+                    let content_with_cursor = format!("{}█{}", before, after);
+                    terminal_column = terminal_column.push(
+                        text(content_with_cursor).style(theme::Text::Color(MATRIX_GREEN))
+                    );
+                } else {
+                    // Regular line
+                    let color = if line.starts_with("Executing:") {
+                        DARK_GREEN
+                    } else {
+                        MATRIX_GREEN
+                    };
+                    
+                    terminal_column = terminal_column.push(
+                        text(line).style(theme::Text::Color(color))
+                    );
+                }
+            } else {
+                // Regular line without cursor
+                let color = if line.starts_with("neo@matrix") {
+                    MATRIX_GREEN
+                } else if line.starts_with("Executing:") {
+                    DARK_GREEN
+                } else {
+                    MATRIX_GREEN
+                };
+                
+                terminal_column = terminal_column.push(
+                    text(line).style(theme::Text::Color(color))
+                );
+            }
+        }
+        
+        // Add an invisible spacer at the bottom to help with scrolling
+        terminal_column = terminal_column.push(vertical_space(1));
+        
+        // Create the scrollable area with an ID for programmatic scrolling
+        let scrollable_id = iced::widget::scrollable::Id::new("terminal_scroll");
+        
+        // Initialize basic scrollable properties
+        let props = iced::widget::scrollable::Properties::new()
+            .width(4)
+            .scroller_width(4)
+            .margin(1);
+        
+        // Only add alignment for initial startup and after command execution
+        // This approach avoids unwanted scroll resets during typing
+        let scrollable = if self.scroll_to_bottom {
+            // Only use alignment for initial setup or after commands
+            let props = props.alignment(iced::widget::scrollable::Alignment::End);
+            
+            // Create scrollable with alignment to see latest content
+            iced::widget::scrollable(terminal_column)
+                .id(scrollable_id)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .direction(iced::widget::scrollable::Direction::Vertical(props))
+        } else {
+            // Create simple scrollable with no automatic behavior
+            // Explicitly avoid on_scroll callback which could cause view refreshes
+            iced::widget::scrollable(terminal_column)
+                .id(scrollable_id)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .direction(iced::widget::scrollable::Direction::Vertical(props))
+        };
+        
+        scrollable.into()
+    }
+}
+
+// Helper function to convert key codes to characters
+fn key_to_char(key_code: keyboard::KeyCode, modifiers: keyboard::Modifiers) -> Option<char> {
+    match key_code {
+        keyboard::KeyCode::A => Some(if modifiers.shift() { 'A' } else { 'a' }),
+        keyboard::KeyCode::B => Some(if modifiers.shift() { 'B' } else { 'b' }),
+        keyboard::KeyCode::C => Some(if modifiers.shift() { 'C' } else { 'c' }),
+        keyboard::KeyCode::D => Some(if modifiers.shift() { 'D' } else { 'd' }),
+        keyboard::KeyCode::E => Some(if modifiers.shift() { 'E' } else { 'e' }),
+        keyboard::KeyCode::F => Some(if modifiers.shift() { 'F' } else { 'f' }),
+        keyboard::KeyCode::G => Some(if modifiers.shift() { 'G' } else { 'g' }),
+        keyboard::KeyCode::H => Some(if modifiers.shift() { 'H' } else { 'h' }),
+        keyboard::KeyCode::I => Some(if modifiers.shift() { 'I' } else { 'i' }),
+        keyboard::KeyCode::J => Some(if modifiers.shift() { 'J' } else { 'j' }),
+        keyboard::KeyCode::K => Some(if modifiers.shift() { 'K' } else { 'k' }),
+        keyboard::KeyCode::L => Some(if modifiers.shift() { 'L' } else { 'l' }),
+        keyboard::KeyCode::M => Some(if modifiers.shift() { 'M' } else { 'm' }),
+        keyboard::KeyCode::N => Some(if modifiers.shift() { 'N' } else { 'n' }),
+        keyboard::KeyCode::O => Some(if modifiers.shift() { 'O' } else { 'o' }),
+        keyboard::KeyCode::P => Some(if modifiers.shift() { 'P' } else { 'p' }),
+        keyboard::KeyCode::Q => Some(if modifiers.shift() { 'Q' } else { 'q' }),
+        keyboard::KeyCode::R => Some(if modifiers.shift() { 'R' } else { 'r' }),
+        keyboard::KeyCode::S => Some(if modifiers.shift() { 'S' } else { 's' }),
+        keyboard::KeyCode::T => Some(if modifiers.shift() { 'T' } else { 't' }),
+        keyboard::KeyCode::U => Some(if modifiers.shift() { 'U' } else { 'u' }),
+        keyboard::KeyCode::V => Some(if modifiers.shift() { 'V' } else { 'v' }),
+        keyboard::KeyCode::W => Some(if modifiers.shift() { 'W' } else { 'w' }),
+        keyboard::KeyCode::X => Some(if modifiers.shift() { 'X' } else { 'x' }),
+        keyboard::KeyCode::Y => Some(if modifiers.shift() { 'Y' } else { 'y' }),
+        keyboard::KeyCode::Z => Some(if modifiers.shift() { 'Z' } else { 'z' }),
+        
+        keyboard::KeyCode::Key1 => Some(if modifiers.shift() { '!' } else { '1' }),
+        keyboard::KeyCode::Key2 => Some(if modifiers.shift() { '@' } else { '2' }),
+        keyboard::KeyCode::Key3 => Some(if modifiers.shift() { '#' } else { '3' }),
+        keyboard::KeyCode::Key4 => Some(if modifiers.shift() { '$' } else { '4' }),
+        keyboard::KeyCode::Key5 => Some(if modifiers.shift() { '%' } else { '5' }),
+        keyboard::KeyCode::Key6 => Some(if modifiers.shift() { '^' } else { '6' }),
+        keyboard::KeyCode::Key7 => Some(if modifiers.shift() { '&' } else { '7' }),
+        keyboard::KeyCode::Key8 => Some(if modifiers.shift() { '*' } else { '8' }),
+        keyboard::KeyCode::Key9 => Some(if modifiers.shift() { '(' } else { '9' }),
+        keyboard::KeyCode::Key0 => Some(if modifiers.shift() { ')' } else { '0' }),
+        
+        // Special characters
+        keyboard::KeyCode::Space => Some(' '),
+        keyboard::KeyCode::Minus => Some(if modifiers.shift() { '_' } else { '-' }),
+        keyboard::KeyCode::Equals => Some(if modifiers.shift() { '+' } else { '=' }),
+        keyboard::KeyCode::Backslash => Some(if modifiers.shift() { '|' } else { '\\' }),
+        keyboard::KeyCode::Grave => Some(if modifiers.shift() { '~' } else { '`' }),
+        keyboard::KeyCode::LBracket => Some(if modifiers.shift() { '{' } else { '[' }),
+        keyboard::KeyCode::RBracket => Some(if modifiers.shift() { '}' } else { ']' }),
+        keyboard::KeyCode::Semicolon => Some(if modifiers.shift() { ':' } else { ';' }),
+        keyboard::KeyCode::Apostrophe => Some(if modifiers.shift() { '"' } else { '\'' }),
+        keyboard::KeyCode::Comma => Some(if modifiers.shift() { '<' } else { ',' }),
+        keyboard::KeyCode::Period => Some(if modifiers.shift() { '>' } else { '.' }),
+        keyboard::KeyCode::Slash => Some(if modifiers.shift() { '?' } else { '/' }),
+        
+        _ => None,
+    }
+}
