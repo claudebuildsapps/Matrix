@@ -76,12 +76,31 @@ pub struct TerminalWindow {
     focused: bool,
     cell_size: Size,
     font_size: f32,
+    // Optimization: Track visible cells range
+    visible_start_row: usize,
+    visible_end_row: usize,
+    visible_start_col: usize,
+    visible_end_col: usize,
+    // Optimization: Cache cell data for faster access
+    cell_cache: Vec<Vec<Option<(char, Color, Color)>>>,
+    // Optimization: Track if cells need redraw
+    cells_dirty: bool,
 }
 
 impl TerminalWindow {
     // Create a new terminal window
     pub fn new(id: Uuid, title: &str) -> Self {
         let emulator = TerminalEmulator::new(id, title);
+        let dimensions = emulator.dimensions().clone();
+        
+        // Initialize cell cache with terminal dimensions
+        let cols = dimensions.columns();
+        let rows = dimensions.screen_lines();
+        let mut cell_cache = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let row = vec![None; cols];
+            cell_cache.push(row);
+        }
         
         Self {
             id,
@@ -94,6 +113,12 @@ impl TerminalWindow {
             focused: false,
             cell_size: Size::new(8.0, 16.0), // Default cell size
             font_size: 14.0,
+            visible_start_row: 0,
+            visible_end_row: rows,
+            visible_start_col: 0,
+            visible_end_col: cols,
+            cell_cache,
+            cells_dirty: true,
         }
     }
     
@@ -114,6 +139,7 @@ impl TerminalWindow {
                 if let Err(e) = self.send_input(&data) {
                     eprintln!("Failed to send input: {}", e);
                 }
+                self.cells_dirty = true;
                 self.cache.clear();
                 None
             }
@@ -122,6 +148,15 @@ impl TerminalWindow {
                 if let Err(e) = self.emulator.resize(columns, rows) {
                     eprintln!("Failed to resize terminal: {}", e);
                 }
+                
+                // Resize cell cache
+                self.cell_cache = Vec::with_capacity(rows as usize);
+                for _ in 0..(rows as usize) {
+                    let row = vec![None; columns as usize];
+                    self.cell_cache.push(row);
+                }
+                
+                self.cells_dirty = true;
                 self.cache.clear();
                 None
             }
@@ -142,6 +177,7 @@ impl TerminalWindow {
                 if let Err(e) = self.send_input(&[c as u8]) {
                     eprintln!("Failed to send key: {}", e);
                 }
+                self.cells_dirty = true;
                 self.cache.clear();
                 None
             }
@@ -167,6 +203,7 @@ impl TerminalWindow {
                 if let Err(e) = self.send_input(&bytes) {
                     eprintln!("Failed to send special key: {}", e);
                 }
+                self.cells_dirty = true;
                 self.cache.clear();
                 None
             }
@@ -199,7 +236,8 @@ impl TerminalWindow {
         // Read output from the terminal
         match self.emulator.read_output() {
             Ok(true) => {
-                // We received some output, so clear the cache
+                // We received some output, so mark cells as dirty
+                self.cells_dirty = true;
                 self.cache.clear();
                 self.last_update = now;
                 true
@@ -261,6 +299,60 @@ impl TerminalWindow {
             .height(Length::Fill)
             .into()
     }
+    
+    // Calculate which cells are visible in the viewport
+    fn update_visible_cell_range(&mut self, bounds: Rectangle) {
+        let width = bounds.width;
+        let height = bounds.height;
+        
+        let cols = self.dimensions().columns();
+        let rows = self.dimensions().screen_lines();
+        
+        // Calculate visible range - add 1 to ensure we render cells that are partially visible
+        let visible_cols = (width / self.cell_size.width).ceil() as usize + 1;
+        let visible_rows = (height / self.cell_size.height).ceil() as usize + 1;
+        
+        // Ensure we don't exceed terminal dimensions
+        self.visible_end_col = visible_cols.min(cols);
+        self.visible_end_row = visible_rows.min(rows);
+        self.visible_start_col = 0;
+        self.visible_start_row = 0;
+    }
+    
+    // Update the cell cache with current terminal state
+    fn update_cell_cache(&mut self) {
+        if !self.cells_dirty {
+            return;
+        }
+        
+        let term = self.emulator.term();
+        
+        // Only update visible cells to save time
+        for row in self.visible_start_row..self.visible_end_row {
+            for col in self.visible_start_col..self.visible_end_col {
+                let point = Point::new(Line(row as i32), Column(col as u16));
+                let cell = term.grid()[point];
+                
+                // Skip empty/spaces if background is default
+                if cell.c == ' ' && cell.bg() == alacritty_terminal::ansi::Color::Named(alacritty_terminal::term::color::NamedColor::Background) {
+                    self.cell_cache[row][col] = None;
+                    continue;
+                }
+                
+                // Cache the cell character and colors
+                let fg_color = MATRIX_GREEN; // Simplified - in a real implementation we'd convert from alacritty colors
+                let bg_color = if cell.bg() != alacritty_terminal::ansi::Color::Named(alacritty_terminal::term::color::NamedColor::Background) {
+                    DARK_GREEN
+                } else {
+                    BACKGROUND
+                };
+                
+                self.cell_cache[row][col] = Some((cell.c, fg_color, bg_color));
+            }
+        }
+        
+        self.cells_dirty = false;
+    }
 }
 
 impl<'a> canvas::Program<TerminalMessage> for TerminalWindow {
@@ -294,6 +386,11 @@ impl<'a> canvas::Program<TerminalMessage> for TerminalWindow {
     
     fn draw(&self, bounds: Rectangle, _cursor: MouseCursor) -> Vec<Geometry> {
         let content = self.cache.draw(bounds.size(), |frame| {
+            // Update visible cell range
+            let mut mutable_self = unsafe { &mut *(self as *const Self as *mut Self) };
+            mutable_self.update_visible_cell_range(bounds);
+            mutable_self.update_cell_cache();
+            
             // Clear the frame with the background color
             frame.fill_rectangle(
                 Point::new(0.0, 0.0).into(),
@@ -306,51 +403,43 @@ impl<'a> canvas::Program<TerminalMessage> for TerminalWindow {
             let cursor_point = self.emulator.cursor_position();
             
             // Iterate through visible cells and draw them
-            for row in 0..self.dimensions().screen_lines() {
-                for col in 0..self.dimensions().columns() {
+            for row in self.visible_start_row..self.visible_end_row {
+                for col in self.visible_start_col..self.visible_end_col {
                     // Get the cell at this position
-                    let point = Point::new(Line(row as i32), Column(col));
-                    let cell = term.grid()[point];
+                    let point = Point::new(Line(row as i32), Column(col as u16));
+                    
+                    // Skip cells that don't need drawing (from cache)
+                    if self.cell_cache[row][col].is_none() {
+                        continue;
+                    }
                     
                     // Calculate pixel position
                     let x = col as f32 * self.cell_size.width;
                     let y = row as f32 * self.cell_size.height;
                     
-                    // Draw the cell background if needed
-                    let bg_color = if point == cursor_point && self.cursor_blink_state && self.focused {
-                        // Cursor position
-                        MATRIX_GREEN
-                    } else if cell.bg() != alacritty_terminal::ansi::Color::Named(alacritty_terminal::term::color::NamedColor::Background) {
-                        // Cell with custom background
-                        DARK_GREEN
-                    } else {
-                        // Default background
-                        continue;
-                    };
+                    // Check if this is the cursor position
+                    let is_cursor = point == cursor_point && self.cursor_blink_state && self.focused;
                     
-                    frame.fill_rectangle(
-                        iced::Point::new(x, y),
-                        Size::new(self.cell_size.width, self.cell_size.height),
-                        bg_color,
-                    );
+                    // Get cached cell info
+                    let (c, mut fg_color, mut bg_color) = self.cell_cache[row][col].unwrap();
+                    
+                    // Override colors for cursor
+                    if is_cursor {
+                        bg_color = MATRIX_GREEN;
+                        fg_color = BACKGROUND;
+                    }
+                    
+                    // Draw the cell background if needed
+                    if bg_color != BACKGROUND {
+                        frame.fill_rectangle(
+                            iced::Point::new(x, y),
+                            Size::new(self.cell_size.width, self.cell_size.height),
+                            bg_color,
+                        );
+                    }
                     
                     // Draw the cell character
-                    if !cell.flags().contains(alacritty_terminal::term::cell::Flags::HIDDEN) {
-                        let c = match cell.c {
-                            ' ' => continue, // Don't draw spaces
-                            c => c,
-                        };
-                        
-                        // Determine text color
-                        let fg_color = if point == cursor_point && self.cursor_blink_state && self.focused {
-                            // Cursor position text
-                            BACKGROUND
-                        } else {
-                            // Normal text
-                            MATRIX_GREEN
-                        };
-                        
-                        // Draw the character
+                    if c != ' ' {
                         let text = Text {
                             content: c.to_string(),
                             position: iced::Point::new(x, y + self.cell_size.height * 0.8),

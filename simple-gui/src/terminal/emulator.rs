@@ -23,6 +23,12 @@ pub struct TerminalEmulator {
     dimensions: Dimensions,
     cursor_position: Point,
     title: String,
+    // Optimization: Track if full redraw is needed
+    needs_full_redraw: bool,
+    // Optimization: Larger read buffer
+    read_buffer: Vec<u8>,
+    // Optimization: Track last read time for throttling
+    last_read_time: std::time::Instant,
 }
 
 impl TerminalEmulator {
@@ -50,6 +56,9 @@ impl TerminalEmulator {
             dimensions,
             cursor_position: Point::new(Line(0), Column(0)),
             title: title.to_string(),
+            needs_full_redraw: true,
+            read_buffer: vec![0u8; 16384], // Increased buffer size (16KB)
+            last_read_time: std::time::Instant::now(),
         }
     }
     
@@ -120,21 +129,34 @@ impl TerminalEmulator {
     
     /// Read output from the PTY and feed it to the terminal
     pub fn read_output(&mut self) -> Result<bool> {
+        // Throttle reads to avoid excessive CPU usage
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_read_time);
+        
+        // Don't read more often than every 5ms
+        if elapsed < std::time::Duration::from_millis(5) {
+            return Ok(false);
+        }
+        
+        self.last_read_time = now;
+        
         if let Some(pty_master) = &mut self.pty_master {
             // Try to get a reader
             let mut reader = pty_master.try_clone_reader()
                 .context("Failed to clone PTY reader")?;
             
             // Read data from the PTY
-            let mut buf = [0u8; 4096];
-            match reader.read(&mut buf) {
+            match reader.read(&mut self.read_buffer) {
                 Ok(n) if n > 0 => {
                     // Process the received data in the terminal
-                    let data = &buf[..n];
+                    let data = &self.read_buffer[..n];
                     self.term.take_child().unwrap().advance_bytes(data);
                     
                     // Update cursor position
                     self.cursor_position = self.term.grid().cursor.point;
+                    
+                    // Mark for full redraw if needed
+                    self.needs_full_redraw = true;
                     
                     return Ok(true); // We read some data
                 }
@@ -169,6 +191,9 @@ impl TerminalEmulator {
                 pixel_height: 0,
             })?;
         }
+        
+        // Mark for full redraw after resize
+        self.needs_full_redraw = true;
         
         Ok(())
     }
@@ -236,5 +261,15 @@ impl TerminalEmulator {
     /// Get a reference to the terminal for rendering
     pub fn term(&self) -> &Term<EventListener> {
         &self.term
+    }
+    
+    /// Check if the terminal needs a full redraw
+    pub fn needs_full_redraw(&self) -> bool {
+        self.needs_full_redraw
+    }
+    
+    /// Mark terminal as fully redrawn
+    pub fn mark_redrawn(&mut self) {
+        self.needs_full_redraw = false;
     }
 }

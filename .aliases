@@ -1,0 +1,2 @@
+# Matrix Terminal aliases
+alias build="./rebuild.sh"

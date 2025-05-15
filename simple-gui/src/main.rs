@@ -10,18 +10,24 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 
 fn main() -> iced::Result {
-    env_logger::init();
+    // Initialize the tokio runtime for async operations
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     
-    MatrixTerminal::run(Settings {
-        window: window::Settings {
-            size: (800, 600),
-            min_size: Some((400, 300)),
-            position: window::Position::Centered,
-            decorations: true,
-            resizable: true,
+    // Execute the application within the context of the runtime
+    rt.block_on(async {
+        env_logger::init();
+        
+        MatrixTerminal::run(Settings {
+            window: window::Settings {
+                size: (1920, 1080), // Default size - will be adjusted based on actual screen size
+                min_size: Some((400, 300)),
+                position: window::Position::Centered,
+                decorations: true,
+                resizable: true,
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
+        })
     })
 }
 
@@ -136,7 +142,7 @@ const DARK_GREEN: Color = Color {
 const BACKGROUND: Color = Color::BLACK;
 
 // Version information
-const VERSION: &str = "v0.6";
+const VERSION: &str = "v0.7";
 
 // Main container style
 struct MatrixStyle;
@@ -230,39 +236,23 @@ impl Application for MatrixTerminal {
     type Flags = ();
 
     fn new(_flags: Self::Flags) -> (Self, Command<Message>) {
-        // Create a much simpler welcome message - will be replaced by animation
+        // Simple minimal welcome message without any prompt text
         let welcome_message = vec![
-            "Wake up, Neo... The Matrix has you...".to_string(),
+            "#".repeat(80), // Just a row of # characters
             "".to_string(),
-            "neo@matrix:~$ ".to_string(),
+            "neo@".to_string(),
         ];
         
         // We'll add the animation via the first tick message
         
-        // Create a centered header with fill characters for secondary terminals
-        let terminal_width: usize = 80; // Standard terminal width
-        let title = format!(" THE MATRIX {} ", VERSION);
-        let fill_char = '═';
+        // Simple header for secondary terminals - just a line of # characters
+        let terminal_width: usize = 80;
         
-        // Calculate padding to center the title
-        let remaining_width = terminal_width.saturating_sub(title.len());
-        let left_pad = remaining_width / 2;
-        let right_pad = remaining_width - left_pad;
-        
-        // Create the centered title with fill characters on both sides
-        let header = format!(
-            "{}{}{}",
-            fill_char.to_string().repeat(left_pad),
-            title,
-            fill_char.to_string().repeat(right_pad)
-        );
-        
-        // Default welcome message for secondary terminals with full-width header
+        // Default welcome message for secondary terminals with simple header
         let secondary_welcome = vec![
+            "#".repeat(terminal_width), // Just a row of # characters
             "".to_string(),
-            header,
-            "".to_string(),
-            "neo@matrix:~$ ".to_string(),
+            "neo@".to_string(),
         ];
         
         // Create additional terminal tabs for split views
@@ -276,7 +266,7 @@ impl Application for MatrixTerminal {
         // Create a vec of cursor positions for secondary terminals
         let mut secondary_cursors = Vec::new();
         for _ in 0..secondary_terminals.len() {
-            secondary_cursors.push("neo@matrix:~$ ".len());
+            secondary_cursors.push("neo@".len());
         }
         
         // Default screen info (will be updated when we get actual screen info)
@@ -289,7 +279,7 @@ impl Application for MatrixTerminal {
         
         let app = Self {
             terminal_content: welcome_message,
-            cursor_position: "neo@matrix:~$ ".len(),
+            cursor_position: "neo@".len(),
             cursor_visible: true,
             cursor_blink_timer: Instant::now(),
             last_update: Instant::now(),
@@ -301,7 +291,7 @@ impl Application for MatrixTerminal {
             focused_terminal: 0, // Primary terminal is focused by default
             secondary_cursors,
             screen_info: default_screen_info,
-            size_division: 4, // Start at 4/8 (half) of the screen size
+            size_division: 8, // Start at 8/8 (full) of the screen size
         };
         
         // Create a command to get screen information and position window in center
@@ -356,14 +346,13 @@ impl Application for MatrixTerminal {
                 // Store screen information
                 self.screen_info = info;
                 
-                // Set initial window to half of screen size (4/8)
-                // Use a perfect rectangle with 16:9 aspect ratio
-                let width = self.screen_info.width / 2; // Half screen width
-                let height = (width as f32 * (9.0 / 16.0)) as u32; // 16:9 aspect ratio
+                // Set initial window to full screen size
+                let width = self.screen_info.width; // Full screen width
+                let height = self.screen_info.height; // Full screen height
                 
-                // Position window in center of screen
-                let position_x = (self.screen_info.width as i32 - width as i32) / 2;
-                let position_y = (self.screen_info.height as i32 - height as i32) / 2;
+                // Position window at top-left corner of screen
+                let position_x = 0;
+                let position_y = 0;
                 
                 // Apply the size and position
                 command = Command::batch(vec![
@@ -377,62 +366,78 @@ impl Application for MatrixTerminal {
                 match icon {
                     // Window size control buttons
                     SidebarIcon::SizeIncrease => {
-                        // Increase size by 10%
-                        // Get current window size
-                        let current_width = self.screen_info.width / 2; // Use the current stored size division
-                        let current_height = (current_width as f32 * (9.0 / 16.0)) as u32; // Keep 16:9 ratio
-                        
-                        // Increase by 10%
-                        let new_width = (current_width as f32 * 1.1) as u32;
-                        let new_height = (current_height as f32 * 1.1) as u32;
-                        
-                        // Keep the window centered
-                        let position_x = (self.screen_info.width as i32 - new_width as i32) / 2;
-                        let position_y = (self.screen_info.height as i32 - new_height as i32) / 2;
-                        
-                        // Update the window size and position via command
-                        command = Command::batch(vec![
-                            command,
-                            window::resize(Size::new(new_width, new_height)),
-                            window::move_to(position_x, position_y),
-                        ]);
-                        
-                        // Add message to the terminal
-                        self.terminal_content.push("Increased window size by 10%".to_string());
-                        self.terminal_content.push("neo@matrix:~$ ".to_string());
-                        self.cursor_position = "neo@matrix:~$ ".len();
-                        self.scroll_to_bottom = true;
+                        // Check if already at full screen
+                        if self.size_division >= 8 {
+                            // Already at maximum, show message
+                            self.terminal_content.push("Window is already at maximum size".to_string());
+                            self.terminal_content.push("neo@".to_string());
+                            self.cursor_position = "neo@".len();
+                            self.scroll_to_bottom = true;
+                        } else {
+                            // Increase size division (up to max of 8)
+                            self.size_division = (self.size_division + 1).min(8);
+                            
+                            // Calculate new size based on division
+                            let scale_factor = self.size_division as f32 / 8.0;
+                            let new_width = (self.screen_info.width as f32 * scale_factor) as u32;
+                            let new_height = (self.screen_info.height as f32 * scale_factor) as u32;
+                            
+                            // Center the window
+                            let position_x = (self.screen_info.width as i32 - new_width as i32) / 2;
+                            let position_y = (self.screen_info.height as i32 - new_height as i32) / 2;
+                            
+                            // Update the window size and position via command
+                            command = Command::batch(vec![
+                                command,
+                                window::resize(Size::new(new_width, new_height)),
+                                window::move_to(position_x, position_y),
+                            ]);
+                            
+                            // Add message to the terminal
+                            self.terminal_content.push("Increased window size".to_string());
+                            self.terminal_content.push("neo@".to_string());
+                            self.cursor_position = "neo@".len();
+                            self.scroll_to_bottom = true;
+                        }
                     },
                     SidebarIcon::SizeDecrease => {
-                        // Decrease size by 10%
-                        // Get current window size
-                        let current_width = self.screen_info.width / 2; // Use the current stored size division
-                        let current_height = (current_width as f32 * (9.0 / 16.0)) as u32; // Keep 16:9 ratio
-                        
-                        // Decrease by 10%
-                        let new_width = (current_width as f32 * 0.9) as u32;
-                        let new_height = (current_height as f32 * 0.9) as u32;
-                        
-                        // Make sure we don't go below minimum size
-                        let new_width = new_width.max(400);
-                        let new_height = new_height.max(225); // Keep 16:9 ratio (400 * 9/16)
-                        
-                        // Keep the window centered
-                        let position_x = (self.screen_info.width as i32 - new_width as i32) / 2;
-                        let position_y = (self.screen_info.height as i32 - new_height as i32) / 2;
-                        
-                        // Update the window size and position via command
-                        command = Command::batch(vec![
-                            command,
-                            window::resize(Size::new(new_width, new_height)),
-                            window::move_to(position_x, position_y),
-                        ]);
-                        
-                        // Add message to the terminal
-                        self.terminal_content.push("Decreased window size by 10%".to_string());
-                        self.terminal_content.push("neo@matrix:~$ ".to_string());
-                        self.cursor_position = "neo@matrix:~$ ".len();
-                        self.scroll_to_bottom = true;
+                        // Check if already at minimum size
+                        if self.size_division <= 1 {
+                            // Already at minimum, show message
+                            self.terminal_content.push("Window is already at minimum size".to_string());
+                            self.terminal_content.push("neo@".to_string());
+                            self.cursor_position = "neo@".len();
+                            self.scroll_to_bottom = true;
+                        } else {
+                            // Decrease size division (down to min of 1)
+                            self.size_division = (self.size_division - 1).max(1);
+                            
+                            // Calculate new size based on division
+                            let scale_factor = self.size_division as f32 / 8.0;
+                            let new_width = (self.screen_info.width as f32 * scale_factor) as u32;
+                            let new_height = (self.screen_info.height as f32 * scale_factor) as u32;
+                            
+                            // Make sure we don't go below minimum size
+                            let new_width = new_width.max(400);
+                            let new_height = new_height.max(225); // Keep 16:9 ratio (400 * 9/16)
+                            
+                            // Center the window
+                            let position_x = (self.screen_info.width as i32 - new_width as i32) / 2;
+                            let position_y = (self.screen_info.height as i32 - new_height as i32) / 2;
+                            
+                            // Update the window size and position via command
+                            command = Command::batch(vec![
+                                command,
+                                window::resize(Size::new(new_width, new_height)),
+                                window::move_to(position_x, position_y),
+                            ]);
+                            
+                            // Add message to the terminal
+                            self.terminal_content.push("Decreased window size".to_string());
+                            self.terminal_content.push("neo@".to_string());
+                            self.cursor_position = "neo@".len();
+                            self.scroll_to_bottom = true;
+                        }
                     },
                     // Regular layout buttons
                     _ => {
@@ -769,28 +774,26 @@ impl Application for MatrixTerminal {
                                         "clear" => {
                                             self.terminal_content.clear();
                                             
-                                            // Create the centered title header
-                                            let terminal_width: usize = 80; // Standard terminal width
-                                            let title = format!(" THE MATRIX {} ", VERSION);
-                                            let fill_char = '═';
+                                            // Calculate the terminal width dynamically
+                                            let window_width = self.screen_info.width;
+                                            let padding_px = 40; // Account for padding, margins, and additional UI elements
+                                            let char_width_px = 8; // Approximate character width
+                                            // For horizontal split or single terminal, use full width
+                                            let terminal_width = if self.layout == TerminalLayout::VerticalSplit || self.layout == TerminalLayout::Grid {
+                                                ((window_width as usize).saturating_sub(padding_px)) / char_width_px / 2
+                                            } else {
+                                                ((window_width as usize).saturating_sub(padding_px)) / char_width_px
+                                            };
                                             
-                                            // Calculate padding to center the title
-                                            let remaining_width = terminal_width.saturating_sub(title.len());
-                                            let left_pad = remaining_width / 2;
-                                            let right_pad = remaining_width - left_pad;
+                                            // Simple header - just a line of # characters
+                                            self.terminal_content.push("#".repeat(terminal_width));
                                             
-                                            // Create the centered title with fill characters on both sides
-                                            let header = format!(
-                                                "{}{}{}",
-                                                fill_char.to_string().repeat(left_pad),
-                                                title,
-                                                fill_char.to_string().repeat(right_pad)
-                                            );
-                                            
-                                            // Add the header after clearing
+                                            // Add empty line
                                             self.terminal_content.push("".to_string());
-                                            self.terminal_content.push(header);
-                                            self.terminal_content.push("".to_string());
+                                            
+                                            // Add command prompt
+                                            self.terminal_content.push("neo@".to_string());
+                                            self.cursor_position = "neo@".len();
                                         },
                                         "help" => {
                                             self.terminal_content.push("Matrix Terminal Commands:".to_string());
@@ -1108,28 +1111,26 @@ impl Application for MatrixTerminal {
                                                         // Clear the terminal but keep the header
                                                         terminal.clear();
                                                         
-                                                        // Create the centered title header
-                                                        let terminal_width: usize = 80; // Standard terminal width
-                                                        let title = format!(" THE MATRIX {} ", VERSION);
-                                                        let fill_char = '═';
+                                                        // Calculate the terminal width dynamically for secondary terminals
+                                                        let window_width = self.screen_info.width;
+                                                        let padding_px = 40; // Account for padding, margins, and sidebar
+                                                        let char_width_px = 8; // Approximate character width
                                                         
-                                                        // Calculate padding to center the title
-                                                        let remaining_width = terminal_width.saturating_sub(title.len());
-                                                        let left_pad = remaining_width / 2;
-                                                        let right_pad = remaining_width - left_pad;
+                                                        // Calculate width based on layout
+                                                        let terminal_width = if self.layout == TerminalLayout::VerticalSplit || self.layout == TerminalLayout::Grid {
+                                                            ((window_width as usize).saturating_sub(padding_px)) / char_width_px / 2
+                                                        } else {
+                                                            ((window_width as usize).saturating_sub(padding_px)) / char_width_px
+                                                        };
                                                         
-                                                        // Create the centered title with fill characters on both sides
-                                                        let header = format!(
-                                                            "{}{}{}",
-                                                            fill_char.to_string().repeat(left_pad),
-                                                            title,
-                                                            fill_char.to_string().repeat(right_pad)
-                                                        );
+                                                        // Simple header - just a line of # characters
+                                                        terminal.push("#".repeat(terminal_width));
                                                         
-                                                        // Add the header after clearing
+                                                        // Add empty line
                                                         terminal.push("".to_string());
-                                                        terminal.push(header);
-                                                        terminal.push("".to_string());
+                                                        
+                                                        // Add command prompt
+                                                        terminal.push("neo@".to_string());
                                                     },
                                                     "whoami" => {
                                                         terminal.push("neo".to_string());
@@ -1330,68 +1331,21 @@ impl Application for MatrixTerminal {
                     // Clear the current content
                     self.terminal_content.clear();
                     
-                    // Matrix quotes for the animation
-                    let quotes = [
-                        "Wake up, Neo...",
-                        "The Matrix has you...",
-                        "Follow the white rabbit.",
-                        "Knock, knock, Neo.",
-                    ];
+                    // Calculate the terminal width dynamically
+                    let window_width = self.screen_info.width;
+                    let padding_px = 40; // Account for padding, margins, and additional UI elements
+                    let char_width_px = 8; // Approximate character width
+                    let terminal_width = ((window_width as usize).saturating_sub(padding_px)) / char_width_px;
                     
-                    // Create a short Matrix-style falling code animation
-                    for i in 0..5 {
-                        // Start with random chars
-                        let mut chars: String = (0..40)
-                            .map(|_| {
-                                let r = self.rng.gen::<u8>() % 94;
-                                (r + 33) as char
-                            })
-                            .collect();
-                        
-                        // Insert a Matrix quote
-                        if i == 2 {
-                            let quote = quotes[self.rng.gen_range(0..quotes.len())];
-                            let padding = (40 - quote.len()) / 2;
-                            if padding > 0 && quote.len() + padding <= 40 {
-                                chars = format!("{:>width$}{}", "", quote, width = padding);
-                                // Pad with Matrix chars
-                                while chars.len() < 40 {
-                                    chars.push((self.rng.gen::<u8>() % 94 + 33) as char);
-                                }
-                            }
-                        }
-                        
-                        self.terminal_content.push(chars);
-                    }
+                    // Simple header - just a line of # characters
+                    self.terminal_content.push("#".repeat(terminal_width));
                     
-                    // Add a header that spans the width of the terminal
+                    // Add empty line
                     self.terminal_content.push("".to_string());
                     
-                    // Calculate approximate width based on terminal size
-                    // For a clean display, we'll use a fixed width rather than try to detect exact terminal width
-                    let terminal_width: usize = 80; // Standard terminal width
-                    
-                    // Create a title with version that's centered
-                    let title = format!(" THE MATRIX {} ", VERSION);
-                    let fill_char = '═';
-                    
-                    // Calculate padding to center the title
-                    let remaining_width = terminal_width.saturating_sub(title.len());
-                    let left_pad = remaining_width / 2;
-                    let right_pad = remaining_width - left_pad;
-                    
-                    // Create the centered title with fill characters on both sides
-                    let header = format!(
-                        "{}{}{}",
-                        fill_char.to_string().repeat(left_pad),
-                        title,
-                        fill_char.to_string().repeat(right_pad)
-                    );
-                    
-                    self.terminal_content.push(header);
-                    self.terminal_content.push("".to_string());
-                    self.terminal_content.push("neo@matrix:~$ ".to_string());
-                    self.cursor_position = "neo@matrix:~$ ".len();
+                    // Add command prompt
+                    self.terminal_content.push("neo@".to_string());
+                    self.cursor_position = "neo@".len();
                     
                     // Force scroll to bottom to show the new content
                     self.scroll_to_bottom = true;
@@ -1636,6 +1590,12 @@ impl MatrixTerminal {
 
     // Method to render a secondary terminal
     fn view_secondary_terminal<'a>(&'a self, index: usize) -> Element<'a, Message> {
+        // First calculate the current terminal width in characters for the secondary terminal
+        let window_width = self.screen_info.width;
+        let padding_px = 40; // Account for padding, margins, and sidebar
+        let char_width_px = 8; // Approximate character width
+        let current_terminal_width = ((window_width as usize).saturating_sub(padding_px)) / char_width_px / 2; // Divide by 2 for split view
+        
         // Make sure the index is valid
         if index >= self.secondary_terminals.len() {
             // Return an empty terminal if index is out of bounds
@@ -1818,6 +1778,12 @@ impl MatrixTerminal {
     }
     
     fn view_terminal<'a>(&'a self) -> Element<'a, Message> {
+        // First calculate the current terminal width in characters
+        let window_width = self.screen_info.width;
+        let padding_px = 20; // Account for padding and margins
+        let char_width_px = 8; // Approximate character width
+        let current_terminal_width = ((window_width as usize).saturating_sub(padding_px)) / char_width_px;
+        
         // Create a scrollable view with content
         let mut terminal_column = column![]
             .spacing(5)
