@@ -88,3 +88,4 @@ venv/
 ENV/
 *.egg-info/
 *.egg
+MatrixTerminal.app
