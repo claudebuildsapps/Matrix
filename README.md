@@ -1,4 +1,4 @@
-# Matrix Terminal - GUI Version
+# Matrix Terminal
 
 A Matrix-inspired terminal multiplexer built as a native GUI application.
 
